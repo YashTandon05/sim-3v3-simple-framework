@@ -22,6 +22,8 @@ from .config import SoccerConfig
 from .runtime import SoccerRuntime
 
 if TYPE_CHECKING:
+    from types import SimpleNamespace
+
     from ..player import Player
     from .types import Context
 
@@ -74,7 +76,9 @@ class SoccerAgentMixin:
             player_class = MyPlayer
 
             @staticmethod
-            def play(context, players): ...
+            def play(context, players, store): ...
+
+            def init_store(self, store): ...
 
     MRO 为 ``[MyAgent, SoccerAgentMixin, AgentBase, object]``,``super().__init__``
     会正确走到 ``AgentBase.__init__``。
@@ -93,8 +97,13 @@ class SoccerAgentMixin:
     def play(
         context: "Context",
         players: "list[Player]",
+        store: "SimpleNamespace",
     ) -> None:
         """30Hz 调用。默认啥都不做;子类按需 override。"""
+
+    # 槽 3:init_store —— 开赛前调一次(可选)
+    def init_store(self, store: "SimpleNamespace") -> None:
+        """默认 no-op;子类按需 override。"""
 
     # ------------------------------------------------------------------
     # 框架内部 —— 用户通常不改

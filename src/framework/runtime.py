@@ -62,16 +62,16 @@ class SoccerRuntime:
         self._agent = agent
         self._config: SoccerConfig = agent.config
         self._source = context_source
+        self._store = SimpleNamespace()
         self._players: list[Player] = [
             agent.player_class(player_id=pid, config=self._config, _backend=None)
             for pid in self._config.player_ids
         ]
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        self._init_store_called = False
         self._last_now: float | None = None
         self._tick_id = 0
-        self._prev_context: Context | None = None
-        self._state = SimpleNamespace(normal_attacker=None, kickoff_taker=None)
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -83,6 +83,9 @@ class SoccerRuntime:
             return
         if self._source is not None:
             self._source.start()
+        if not self._init_store_called:
+            self._agent.init_store(self._store)
+            self._init_store_called = True
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._loop, name="soccer_runtime", daemon=True,
@@ -152,7 +155,7 @@ class SoccerRuntime:
         self._draw_world(ctx)
 
         # 调用用户 play();框架不强制其行为
-        self._agent.play(ctx, self._players)
+        self._agent.play(ctx, self._players, self._store)
 
         debugdraw.flush()
 
@@ -247,13 +250,8 @@ class SoccerRuntime:
     # ------------------------------------------------------------------
 
     def _build_context(self, now: float, dt: float) -> Context:
-        """构造当前帧的 Context 快照。
-
-        从数据源获取原始快照，经过新鲜度过滤后构造只读 Context。
-        game 字段中的 phase 和 strategy_state 由 _fresh_game 注入。
-        """
         snap = self._source.get_snapshot() if self._source is not None else WorldSnapshot()
-        ctx = Context(
+        return Context(
             now=now,
             dt=dt,
             team_id=self._config.team_id,
@@ -266,27 +264,16 @@ class SoccerRuntime:
             opponents={
                 pid: self._fresh_robot(r, now) for pid, r in snap.opponents.items()
             },
-            pre_context=self._prev_context,
         )
-        self._prev_context = ctx
-        return ctx
 
     def _fresh_game(
         self, game: GameControlState | None, now: float,
     ) -> GameControlState | None:
-        """新鲜度检查并注入策略相关字段。
-
-        检查通过后，计算当前比赛阶段并注入策略跨帧状态容器。
-        """
         if game is None:
             return None
         if now - game.last_seen_at > self._config.game_state_max_age_sec:
             return None
-        return dataclasses.replace(
-            game,
-            phase=game._compute_phase(self._config.team_id),
-            strategy_state=self._state,
-        )
+        return game
 
     def _fresh_ball(self, ball: BallState | None, now: float) -> BallState | None:
         if ball is None:
