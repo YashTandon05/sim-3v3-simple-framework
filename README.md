@@ -1,6 +1,11 @@
-本项目是Booster Champion比赛策略框架的状态机版本，在Booster Studio中使用
+Simplified Version of Booster Champion 3v3 Soccer Tournament agent
 
-技术支持和咨询请关注
+How to use
+Download Booster Studio
+Open this project from Booster Studio
+Waiting for environment prepare
+Select a Virtual Robot
+Just click "Activate, build, deploy and run agent"
+
+more info:
 https://booster.feishu.cn/wiki/RwYkw3004iV39hk6uJOcu2ctnah
-
-
