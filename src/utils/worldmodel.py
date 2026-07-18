@@ -32,6 +32,7 @@ __all__ = [
     "BallEstimate",
     "BallTracker",
     "goal_line_crossing",
+    "intercept_point",
     "predict_position",
 ]
 
@@ -136,6 +137,34 @@ def predict_position(est: BallEstimate, t: float) -> tuple[float, float]:
     committing early, which is the safe direction.
     """
     return (est.x + est.vx * t, est.y + est.vy * t)
+
+
+def intercept_point(
+    est: BallEstimate,
+    px: float,
+    py: float,
+    speed: float,
+    horizon: float,
+    step: float,
+) -> tuple[float, float]:
+    """Earliest point where a robot at (px, py) moving at ``speed`` can meet the
+    rolling ball.
+
+    Scans the constant-velocity prediction in ``step`` increments up to
+    ``horizon`` and returns the first predicted position the robot can reach in
+    time. If the ball can't be met inside the horizon, returns the horizon
+    prediction (head it off rather than trail it); if the ball isn't reliably
+    moving, returns its current position. Caller should clamp the result inside
+    the field (the linear prediction ignores lines and bounces)."""
+    if not est.moving:
+        return (est.x, est.y)
+    t = 0.0
+    while t <= horizon:
+        bx, by = predict_position(est, t)
+        if math.hypot(bx - px, by - py) <= speed * t:
+            return (bx, by)
+        t += step
+    return predict_position(est, horizon)
 
 
 def goal_line_crossing(

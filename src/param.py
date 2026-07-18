@@ -73,6 +73,13 @@ BALL_VEL_SMOOTH_ALPHA = 0.4       # EMA smoothing factor (0..1): higher = more r
 BALL_VEL_RESET_DT_S = 0.4         # If the gap between observations exceeds this, discard the diff and reset velocity (s)
 BALL_VEL_STATIONARY_SPEED = 0.2   # Below this speed, treat the ball as stationary (m/s), to avoid noise-driven jitter
 
+# --- Interception: chase where the ball is GOING, not where it is ---
+# Chasers meet a rolling ball at the earliest reachable point on its predicted
+# path instead of trailing its current position (which loses every race).
+INTERCEPT_SPEED_MPS = 0.45        # assumed robot travel speed for the meet-point solve (the gait's realistic pace)
+INTERCEPT_HORIZON_S = 2.5         # search the predicted path this far ahead; beyond it, head the ball off at the horizon point
+INTERCEPT_STEP_S = 0.1            # time step of the meet-point scan
+
 
 # ======================================================================
 # Player technical action parameters: goalkeeping / support
@@ -89,17 +96,42 @@ GUARD_THREAT_EXIT_X = -0.7
 # it hugs the goal line (guarding against chips/rebounds). Step-out distance
 # is linearly interpolated based on ball-to-goal distance.
 KEEPER_STEP_OUT_MIN_M = 0.35      # Minimum step-out distance (m): hug the goal line when ball is far
-KEEPER_STEP_OUT_MAX_M = 1.2       # Maximum step-out distance (m): close the angle when ball is near
+KEEPER_STEP_OUT_MAX_M = 0.95      # Maximum step-out distance (m): close the angle when ball is near. Lowered 1.2->0.95 so the keeper stays deeper, covers more of the mouth, and has less ground to make up laterally on a save.
 KEEPER_BALL_NEAR_M = 2.5          # Ball-to-goal distance <= this -> use max step-out distance (m)
 KEEPER_BALL_FAR_M = 6.5           # Ball-to-goal distance >= this -> use min step-out distance (m)
 KEEPER_LATERAL_MARGIN_M = 0.35    # Lateral range of motion: half goal width + this extension (m)
 
 # --- Save: when the ball moves fast toward goal, slide to the predicted crossing point to block it ---
 KEEPER_SAVE_LINE_M = 0.4          # Shallow stance line the keeper drops back to during a save (from goal center, m)
-KEEPER_SAVE_BALL_SPEED = 0.7      # Ball speed >= this and heading at goal -> enter save mode (m/s)
-KEEPER_SAVE_EXIT_SPEED = 0.35     # Save hysteresis: ball speed must drop below this to exit save mode (m/s)
-KEEPER_SAVE_HORIZON_S = 2.0       # Only save shots predicted to reach the goal line within this time (s)
-KEEPER_SAVE_MOUTH_MARGIN_M = 0.5  # Still save if the predicted crossing point is within this range outside the posts (m)
+KEEPER_SAVE_BALL_SPEED = 0.5      # Ball speed >= this and heading at goal -> enter save mode (m/s). Lowered 0.7->0.5 so it reacts to the slower shots the gait produces.
+KEEPER_SAVE_EXIT_SPEED = 0.3      # Save hysteresis: ball speed must drop below this to exit save mode (m/s)
+KEEPER_SAVE_HORIZON_S = 2.5       # Only save shots predicted to reach the goal line within this time (s). Raised 2.0->2.5 to commit to the crossing earlier.
+KEEPER_SAVE_MOUTH_MARGIN_M = 0.65 # Still save if the predicted crossing point is within this range outside the posts (m)
+KEEPER_ANTICIPATE_S = 0.35        # Arc positioning leads a moving ball by this many seconds (anticipate lateral movement instead of chasing its current spot)
+
+# --- Goalkeeper dive (predefined SDK motion) ---
+# The SDK exposes canned motions via list_actions()/do_action(id). Each robot
+# backend logs the available list once at startup ("player N available SDK
+# actions: ..."): run the sim, find the dive entries in that log, and put their
+# ids here EXACTLY as listed (string or int). While either id is None, diving is
+# disabled and the keeper saves on its feet as before.
+KEEPER_DIVE_ACTION_LEFT = None    # action id for a dive to the keeper's LEFT (+y when facing upfield)
+KEEPER_DIVE_ACTION_RIGHT = None   # action id for a dive to the keeper's RIGHT (-y)
+KEEPER_DIVE_MIN_LATERAL_M = 0.35  # dive only when the crossing point is at least this far to the side (a quick step covers less)
+KEEPER_DIVE_MAX_LATERAL_M = 1.5   # ...and no farther than this (beyond a dive's reach -> stay on feet and cover what we can)
+KEEPER_DIVE_MAX_TIME_S = 1.0      # dive only when the ball arrives within this (walking can't make it in time)
+KEEPER_DIVE_BUSY_S = 2.0          # after triggering, send no commands for this long (the canned motion owns the body)
+KEEPER_DIVE_COOLDOWN_S = 4.0      # minimum time between dives (getting up takes a while)
+
+# --- Keeper 1v1 confront: rush out when an opponent is through on goal ---
+# When an opponent has the ball close to our goal and none of our field players
+# are back, waiting on the line concedes an easy finish. Rush off the line to
+# smother the ball / shrink the shooting angle instead.
+KEEPER_CONFRONT_RANGE_M = 4.5     # ball-to-goal distance to start rushing out (m)
+KEEPER_CONFRONT_EXIT_M = 5.3      # hysteresis: stop confronting once the ball is beyond this (m)
+KEEPER_CONFRONT_OPP_ON_BALL_M = 1.2  # an opponent within this of the ball counts as in possession
+KEEPER_CONFRONT_TEAMMATE_M = 2.0  # 1v1 = no teammate (other than the keeper) within this of the ball
+KEEPER_CONFRONT_GAP_M = 0.7       # stand this short of the ball on the ball->goal line (block/smother stance)
 
 # --- Fixed keeper assignment (QW2) ---
 # One robot is permanently the goalkeeper. If that robot is unavailable
@@ -146,9 +178,11 @@ SUPPORT_ATTACK_WIDE_M = 1.8        # ...and this far to the open (fewer-opponent
 
 # --- Attacker shot / pass selection (QW4/QW6) ---
 # Shooting is the PRIORITY: shoot from anywhere with a clear angle to goal, even
-# long range. Only pass when there's no shooting angle.
-SHOT_RANGE_M = 8.0                 # shoot within this distance of the opponent goal (covers ~most of the field)
+# long range. Only pass when there's no shooting angle. Volume beats placement
+# here — their keepers are weak and our crasher feeds on rebounds.
+SHOT_RANGE_M = 9.0                 # shoot within this distance of the opponent goal (raised 8->9: covers their whole half)
 SHOT_LANE_RADIUS_M = 0.45          # shot lane counts as blocked if an opponent is within this of the line
+SHOT_FORCE_RANGE_M = 5.0           # within this of their goal (and in their half), shoot EVEN WITHOUT a clean lane — deflections + rebounds still become chances
 PASS_ADVANCE_MARGIN_M = 1.5        # pass only to a teammate at least this much closer to the opp goal
 PASS_LANE_RADIUS_M = 0.45          # pass lane blocked radius
 
@@ -158,11 +192,19 @@ PASS_RECEIVE_WINDOW_S = 1.2        # after a pass, the intended receiver commits
 BALL_COLLECT_DIST_M = 0.6         # ball counts as collected once a (non-passing) field player is this close
 
 # --- Possession / pressure (QW5) ---
-# Retain the ball rather than boot it away: only CLEAR when genuinely pressured
-# AND deep; otherwise carry (dribble) or pass to keep possession.
+# Retain the ball rather than boot it away, BUT safety comes first: when pressed
+# anywhere in our OWN half, CLEAR it (don't dribble/thread a pass out of
+# defense — that's how we leaked goals). Only build/keep when unpressured.
 PRESSURE_DIST_M = 1.8             # an opponent within this of the ball = we're under pressure (raised 1.5->1.8 to react earlier, since reorienting to kick is slow)
-DANGER_RADIUS_M = 3.5             # ball within this of our own goal = danger zone (clear under pressure; escalate defense)
-SUPPORT_DEEP_DIST_M = 1.3         # tight second-line distance from the ball when defending inside the danger zone
+DANGER_RADIUS_M = 3.5             # ball within this of our own goal = danger zone (escalate defense: 2nd robot drops into the box)
+SUPPORT_DEEP_DIST_M = 1.3         # (legacy) tight second-line distance from the ball; superseded by the box-guard drop in danger
+
+# --- Clearance-first scan (pressed in our own half) ---
+# Pick the clearance lane with the most room: forward toward the opponent goal
+# when that's open, or sideways to a touchline when the middle is congested.
+CLEAR_SCAN_MAX_DEG = 90          # scan up to +/- this from "toward opp goal" (90 = allow a straight-sideways clearance, never backward)
+CLEAR_SCAN_STEP_DEG = 15         # scan resolution
+CLEAR_LOOK_M = 3.0               # how far down each candidate lane to check for opponents
 
 # --- Pressure escape / marking / adaptive outlet (QW7) ---
 # Reorienting to kick is slow, so under pressure RELEASE fast: prefer a pass that
@@ -213,21 +255,33 @@ SET_PLAY_DEFENDER_SPREAD_M = 0.8  # Lateral spacing between retreating defenders
 # Set pieces — designed restarts (kickoff + our/opp set plays)
 # ======================================================================
 
-# --- Our kickoff: keep possession ---
-# Instead of booting the ball straight into the opponent half (gifted to their
-# keeper), play a designed diagonal pass into space on the supporter's (open)
-# wing so we retain possession and immediately build an attack.
-KICKOFF_PASS_AHEAD_M = 1.5      # forward (into opp half) component of the kickoff pass target
-KICKOFF_PASS_WIDE_M = 2.0       # lateral component, toward the supporter's (open) wing
-KICKOFF_PASS_POWER = 4.5        # controlled pass, not a boot
+# --- Our kickoff: back-pass restart ---
+# Shooting straight from the kickoff isn't allowed, so we restart with a very
+# soft BACKWARD pass: only the taker may cross halfway (and only inside the
+# center circle), so it walks around to the far side of the ball and taps it
+# back to the supporter waiting behind the center spot in our half. Play then
+# flows to NORMAL with us in possession, facing forward, out of shot range (so
+# the receiver builds up instead of blasting from midfield).
+KICKOFF_BACKPASS_X_M = -2.0     # receiving spot: this far into our half (outside the circle)
+KICKOFF_BACKPASS_Y_M = 0.6      # ...offset laterally so the lane misses the taker's ready slot
+KICKOFF_BACKPASS_POWER = 1.2    # barely rolls — the receiver takes it at its feet
+# Fallback tap (lone taker / shot clock about to expire): nudge it ahead instead.
+KICKOFF_TAP_AHEAD_M = 1.0       # tap target this far straight ahead of the ball
+KICKOFF_TAP_POWER = 2.5         # very soft — keep the ball close, don't launch it
+
+# --- Set-play shot clock ---
+# Restarts must be taken before the game controller's secondary_time expires,
+# or possession is forfeited. When it runs low, stop being clever and just put
+# the ball in play.
+SET_PLAY_PANIC_S = 3            # secondary_time at/below this -> take the restart NOW
 
 # --- Our attacking set plays ---
-# Corner: deliver a cross to the near-post danger area where the second field
-# player (crasher) attacks it — a direct corner shot is geometrically hopeless
-# for these robots, so we always cross.
-CORNER_DELIVERY_DEPTH_M = 2.0   # cross to this far in front of the opp goal line
+# Corner: pass directly to the teammate crashing the near-post area (a big fixed
+# cross sailed out for a goal kick). The delivery point matches where the
+# crasher goes, and it's well inside the field so it can't run out of play.
+CORNER_DELIVERY_DEPTH_M = 1.0   # deliver to this far in front of the opp goal line (near post)
 CORNER_DELIVERY_WIDE_M = 1.0    # ...and this far to the near-post (corner) side
-CORNER_DELIVERY_POWER = 5.0
+CORNER_DELIVERY_POWER = 3.5     # controlled cross, not a boot (a hard one sails over the end line)
 
 # --- Defending set plays (opponent's) ---
 # Cross defense (opponent corner / deep free kick / deep throw): man-mark

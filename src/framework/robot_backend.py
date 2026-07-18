@@ -64,6 +64,7 @@ class RobotBackend:
         self._wake = threading.Event()
         self._worker_stop = threading.Event()
         self._last_get_up_at = 0.0
+        self._actions_probed = False   # one-shot startup log of the SDK's predefined action list
         self._worker = threading.Thread(
             target=self._worker_loop,
             name=f"backend_worker_{player_id}",
@@ -188,6 +189,13 @@ class RobotBackend:
         self._last_get_up_at = now
         self._enqueue(("get_up", None))
 
+    def do_action(self, action_id: object) -> None:
+        """Asynchronously trigger a predefined SDK motion (e.g. a goalkeeper
+        dive). The canned motion owns the body while it runs; afterwards the
+        mode is unknown, so ``ensure_ready`` re-requests walk and the robot
+        self-recovers. Action ids come from the startup ``list_actions`` log."""
+        self._enqueue(("action", action_id))
+
     def _enqueue(self, intent: tuple[str, object]) -> None:
         with self._slot_lock:
             self._pending = intent   # overwrite semantics: only the latest is kept
@@ -206,6 +214,7 @@ class RobotBackend:
             # automatically re-call request_mode and self-heal.
             self._poll_mode()
             self._poll_fall_down_state()
+            self._probe_actions_once()
             with self._slot_lock:
                 intent = self._pending
                 self._pending = None
@@ -216,6 +225,8 @@ class RobotBackend:
                 self._exec_set_mode(cast(str, arg))
             elif kind == "get_up":
                 self._exec_get_up()
+            elif kind == "action":
+                self._exec_action(arg)
 
     def _poll_mode(self) -> None:
         try:
@@ -264,3 +275,37 @@ class RobotBackend:
             _log.info("player %d get_up done", self._player_id)
         except Exception as exc:
             _log.warning("player %d get_up failed: %s", self._player_id, exc)
+
+    def _probe_actions_once(self) -> None:
+        """Log the SDK's predefined action list once at startup, so the real
+        action ids (e.g. a dive) can be read from the match log and configured
+        in param.py (``KEEPER_DIVE_ACTION_LEFT/RIGHT``)."""
+        if self._actions_probed:
+            return
+        self._actions_probed = True
+        try:
+            list_fn = getattr(self._robot, "list_actions", None)
+            if callable(list_fn):
+                _log.info(
+                    "player %d available SDK actions: %s",
+                    self._player_id, list_fn(),
+                )
+            else:
+                _log.info("player %d SDK has no list_actions", self._player_id)
+        except Exception as exc:
+            _log.info("player %d list_actions failed: %s", self._player_id, exc)
+
+    def _exec_action(self, action_id: object) -> None:
+        """Run a predefined SDK motion synchronously on the worker. Kicking is
+        released first (it owns the chassis); afterwards mode is unknown, so the
+        normal ensure_ready path re-requests walk mode and the robot recovers."""
+        try:
+            self.release_kick()
+            self._robot.do_action(action_id)
+            self._mode = None
+            _log.info("player %d action %r done", self._player_id, action_id)
+        except Exception as exc:
+            _log.warning(
+                "player %d do_action(%r) failed: %s",
+                self._player_id, action_id, exc,
+            )

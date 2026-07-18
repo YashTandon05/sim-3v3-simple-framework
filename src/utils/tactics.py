@@ -31,12 +31,14 @@ __all__ = [
     "attacking_outlet_spot",
     "opponent_keeper_pos",
     "best_shot",
+    "forced_shot_direction",
     "best_pass_target",
     "nearest_opponent_dist",
     "safe_pass_target",
     "quick_pass_target",
     "escape_direction",
     "carry_direction",
+    "clearance_direction",
     "marking_assignment",
     "opponents_overcommitted",
     "adaptive_outlet_ahead",
@@ -211,9 +213,12 @@ def best_shot(
         return None
 
     inset = 0.3
+    edge = half_goal - inset
     corners = [
-        (goal_x, half_goal - inset),
-        (goal_x, -(half_goal - inset)),
+        (goal_x, edge),
+        (goal_x, -edge),
+        (goal_x, edge / 2.0),
+        (goal_x, -edge / 2.0),
         (goal_x, 0.0),
     ]
     keeper = opponent_keeper_pos(context)
@@ -233,6 +238,25 @@ def best_shot(
             continue
         return direction
     return None
+
+
+def forced_shot_direction(
+    context: Context, ball_x: float, ball_y: float,
+) -> float:
+    """Shot direction with NO lane requirement: aim at the goal-mouth corner
+    farthest from their keeper and just hit it.
+
+    Used close to their goal when no clean lane exists — a blocked shot still
+    produces deflections and rebounds in the box (where our crasher waits),
+    which beats turning away from goal. Volume of shots > purity of shots."""
+    goal_x = context.field.length / 2.0
+    edge = context.field.goal_width / 2.0 - 0.3
+    corners = [(goal_x, edge), (goal_x, -edge)]
+    keeper = opponent_keeper_pos(context)
+    if keeper is not None:
+        corners.sort(key=lambda c: -abs(c[1] - keeper[1]))
+    ax, ay = corners[0]
+    return math.atan2(ay - ball_y, ax - ball_x)
 
 
 def best_pass_target(
@@ -417,6 +441,61 @@ def carry_direction(
         if _segment_clear(ball_x, ball_y, px, py, opp, avoid_radius):
             return d
     return goal_dir
+
+
+def _ray_clearance(
+    bx: float, by: float, direction: float,
+    opp: list[tuple[float, float]], look: float,
+) -> float:
+    """Smallest perpendicular distance to any opponent lying ahead
+    (``0 < t <= look``) along the ray from (bx,by) in ``direction``; ``inf`` if
+    the corridor is empty (the more open, the larger)."""
+    ux, uy = math.cos(direction), math.sin(direction)
+    best = math.inf
+    for ox, oy in opp:
+        rx, ry = ox - bx, oy - by
+        t = rx * ux + ry * uy
+        if t <= 0.0 or t > look:
+            continue
+        lateral = abs(-rx * uy + ry * ux)
+        if lateral < best:
+            best = lateral
+    return best
+
+
+def clearance_direction(
+    context: Context,
+    ball_x: float,
+    ball_y: float,
+    prefer_dir: float,
+    scan_max_deg: float,
+    scan_step_deg: float,
+    look: float,
+) -> float:
+    """Best direction to hoof a clearance under pressure in our own half.
+
+    Scans a wide forward arc around ``prefer_dir`` (toward the opponent goal)
+    and returns the lane with the most room from the nearest opponent,
+    tie-broken toward ``prefer_dir``. The ball goes forward when that's open, or
+    sideways toward a touchline when the middle is congested — never backward
+    toward our own goal (the arc is limited to +/- ``scan_max_deg`` <= 90)."""
+    opp = _opp_positions(context)
+    if not opp:
+        return prefer_dir
+    # Any lane with >= this much room is "clear enough" — treat them as equally
+    # safe so we don't needlessly deflect away from a defender who's only near
+    # the wide edge of the forward lane; the tie-break then keeps us forward.
+    good = 1.0
+    best_dir = prefer_dir
+    best_score = -math.inf
+    n = int(scan_max_deg / scan_step_deg)
+    for i in range(-n, n + 1):
+        d = prefer_dir + math.radians(i * scan_step_deg)
+        clr = min(_ray_clearance(ball_x, ball_y, d, opp, look), good)
+        score = clr - 0.001 * abs(i)         # tie-break toward forward (prefer_dir)
+        if score > best_score:
+            best_score, best_dir = score, d
+    return best_dir
 
 
 def marking_assignment(
