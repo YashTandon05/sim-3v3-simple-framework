@@ -24,6 +24,16 @@ KICK_POWER_DEFAULT = 5.0
 KICK_POWER_BACKFIELD = 5.0
 KICK_POWER_OUR_KICKOFF = 5.0
 
+# Kick power tiers (QW4). All clamped to [KICK_POWER_MIN, KICK_POWER_MAX].
+KICK_POWER_SHOT = 8.0          # full shot on goal
+KICK_POWER_CLEAR = 8.0         # hard clearance upfield when in our own half
+KICK_POWER_CARRY = 3.5         # gentle nudge to advance the ball (dribble upfield)
+# Passing is deliberately SOFT so the receiver can actually collect it (a hard
+# pass overshoots and the receiver can't get to it). Tune against sim physics.
+PASS_POWER_MIN = 2.0
+PASS_POWER_MAX = 4.5
+PASS_POWER_PER_M = 0.4         # pass power scales gently with distance to the target
+
 
 # ======================================================================
 # Player movement control
@@ -97,6 +107,16 @@ KEEPER_SAVE_MOUTH_MARGIN_M = 0.5  # Still save if the predicted crossing point i
 # promoted so the net is never abandoned.
 KEEPER_PLAYER_ID = 1              # Player id permanently assigned as goalkeeper
 
+# --- Keeper repositioning + sweeping ---
+# Repositioning speed: the keeper strafes (slow, heel-to-heel) when it faces the
+# ball while moving. So for a large move it faces the travel direction and walks
+# forward (fast); only once within KEEPER_SETTLE_DIST_M of its spot does it
+# square up to the ball (ready to react, small strafes only).
+KEEPER_SETTLE_DIST_M = 0.5       # > this from target -> face travel (fast walk); <= this -> face ball (square)
+# Sweeping/claiming: come out to grab a loose ball rather than sit on the line.
+KEEPER_CLAIM_DIST_M = 2.0        # come out to claim a loose ball within this range, IF we're the closest robot to it
+KEEPER_CLAIM_EXIT_M = 2.7        # keep claiming until the ball is beyond this (hysteresis, avoids in/out flapping)
+
 SUPPORT_DIST_M = 3.0
 
 # ======================================================================
@@ -123,6 +143,26 @@ POSSESSION_MARGIN_M = 0.4          # Possession is "ours"/"theirs" only when one
 
 SUPPORT_ATTACK_AHEAD_M = 2.0       # Attacking outlet stands this far ahead of the ball (toward opp goal)
 SUPPORT_ATTACK_WIDE_M = 1.8        # ...and this far to the open (fewer-opponents) side
+
+# --- Attacker shot / pass selection (QW4/QW6) ---
+# Shooting is the PRIORITY: shoot from anywhere with a clear angle to goal, even
+# long range. Only pass when there's no shooting angle.
+SHOT_RANGE_M = 8.0                 # shoot within this distance of the opponent goal (covers ~most of the field)
+SHOT_LANE_RADIUS_M = 0.45          # shot lane counts as blocked if an opponent is within this of the line
+PASS_ADVANCE_MARGIN_M = 1.5        # pass only to a teammate at least this much closer to the opp goal
+PASS_LANE_RADIUS_M = 0.45          # pass lane blocked radius
+
+# --- Rebound crash + pass reception (QW6) ---
+REBOUND_DEPTH_M = 1.2              # when a shot is on, the other robot crashes to this far in front of the opp goal
+PASS_RECEIVE_WINDOW_S = 1.2        # after a pass, the intended receiver commits to collecting for this long
+BALL_COLLECT_DIST_M = 0.6         # ball counts as collected once a (non-passing) field player is this close
+
+# --- Possession / pressure (QW5) ---
+# Retain the ball rather than boot it away: only CLEAR when genuinely pressured
+# AND deep; otherwise carry (dribble) or pass to keep possession.
+PRESSURE_DIST_M = 1.5              # an opponent within this of the ball = we're under pressure
+DANGER_RADIUS_M = 3.5             # ball within this of our own goal = danger zone (clear under pressure; escalate defense)
+SUPPORT_DEEP_DIST_M = 1.3         # tight second-line distance from the ball when defending inside the danger zone
 
 
 # ======================================================================

@@ -26,7 +26,13 @@ from .framework.agent import SoccerAgentMixin
 from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
 from .player import Player
-from .utils import defensive_screen_spot, dist, opponent_goal, own_goal
+from .utils import (
+    defensive_screen_spot,
+    dist,
+    opponent_goal,
+    own_goal,
+    own_goal_area_center,
+)
 from .utils.tactics import POSSESSION_OURS, POSSESSION_THEIRS, read_possession
 from .utils.worldmodel import BallTracker
 
@@ -130,6 +136,8 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.ball_tracker = BallTracker()  # Cross-frame ball velocity estimator (world-model foundation)
         store.ball_est = None               # This frame's ball position+velocity estimate (updated every play() call)
         store.defend_mode = False           # Team mode: True = press+cover (opp has ball in our half), False = attack+outlet
+        store.pass_active_until = 0.0        # Time (context.now) until which the receiver commits to a pass
+        store.pass_from_id = None            # Player id that played the active pass (so it doesn't chase its own pass)
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -302,6 +310,39 @@ def _update_team_mode(context: Context, store) -> None:
     # else contested in our half -> keep previous store.defend_mode
 
 
+def _ball_near_own_goal(context: Context) -> bool:
+    """True when the ball is inside our danger zone (close to our own goal)."""
+    ball = context.ball
+    if ball is None:
+        return False
+    gx, gy = own_goal(context)
+    return dist(ball.x, ball.y, gx, gy) < DANGER_RADIUS_M
+
+
+def _ball_in_shot_range(context: Context) -> bool:
+    """True when the ball is close enough to the opponent goal that a shot is on
+    (so the off-ball player should crash for a rebound)."""
+    ball = context.ball
+    if ball is None:
+        return False
+    ox, oy = opponent_goal(context)
+    return dist(ball.x, ball.y, ox, oy) < SHOT_RANGE_M
+
+
+def _ball_collected(context: Context, field: list[Player], exclude_id) -> bool:
+    """True when a field player other than ``exclude_id`` is on the ball (a pass
+    has been received / the ball is under our control)."""
+    ball = context.ball
+    if ball is None:
+        return False
+    for p in field:
+        if p.id == exclude_id or p.pose is None:
+            continue
+        if dist(p.pose.x, p.pose.y, ball.x, ball.y) < BALL_COLLECT_DIST_M:
+            return True
+    return False
+
+
 def _act_normal(context: Context, players: list[Player], store) -> None:
     """NORMAL: fixed keeper guards; the two field players take possession-aware
     dynamic roles.
@@ -322,12 +363,14 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
         return
 
     _update_team_mode(context, store)
+    danger = _ball_near_own_goal(context)
 
-    # Debug: show the team mode + possession read near the bottom touchline.
+    # Debug: show team mode + possession + danger near the bottom touchline.
     from .framework import debugdraw
     debugdraw.text(
         0.0, -context.field.width / 2.0 - 0.2,
-        f"mode={'DEFEND' if store.defend_mode else 'ATTACK'} poss={read_possession(context)}",
+        f"mode={'DEFEND' if store.defend_mode else 'ATTACK'} "
+        f"poss={read_possession(context)}{' DANGER' if danger else ''}",
         rgb=(0.6, 1.0, 0.6), ns="team_mode",
     )
 
@@ -338,14 +381,39 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
     primary.action = "press" if store.defend_mode else "attack"
     primary.attack()
 
-    # The other field player(s): defensive cover when defending, advanced
-    # attacking outlet when attacking.
+    # Coordinate off the primary's kick decision this frame:
+    # - a pass opens a short window where the OTHER field player collects it.
+    if getattr(primary, "_kick_intent", None) == "pass":
+        store.pass_active_until = context.now + PASS_RECEIVE_WINDOW_S
+        store.pass_from_id = primary.id
+    pass_active = context.now < getattr(store, "pass_active_until", 0.0)
+    if pass_active and _ball_collected(context, field, getattr(store, "pass_from_id", None)):
+        store.pass_active_until = 0.0
+        pass_active = False
+    shot_on = _ball_in_shot_range(context)
+
+    # The other field player(s), in ATTACK mode:
+    # - receive: go collect an in-flight pass (not the passer itself);
+    # - crash: a shot is on -> crash the box for the rebound/deflection;
+    # - outlet: otherwise hold an advanced passing/shooting option.
+    # In DEFEND mode: second-line cover, tightened to a goal-side block in the
+    # danger zone so both robots defend.
     for p in field:
         if p is primary:
             continue
         if store.defend_mode:
-            p.action = "cover"
-            p.support()
+            if danger:
+                p.action = "defend_deep"
+                p.support(SUPPORT_DEEP_DIST_M)
+            else:
+                p.action = "cover"
+                p.support()
+        elif pass_active and p.id != getattr(store, "pass_from_id", None):
+            p.action = "receive"
+            p.attack()
+        elif shot_on:
+            p.action = "crash"
+            p.crash_net()
         else:
             p.action = "outlet"
             p.support_attack()
@@ -385,7 +453,7 @@ def _act_opp_kickoff(context: Context, players: list[Player], store) -> None:
     positions in our half, outside the center circle (staying clear of the ball)."""
     keeper, field = _assign_keeper(context, players)
     if keeper is not None:
-        keeper.guard(store.ball_est)
+        keeper.guard(store.ball_est, allow_claim=False)
 
     r = context.field.circle_radius
     slots = [(-r - 0.5, 0.0), (-r - 2.0, 0.5)]
@@ -421,7 +489,7 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
     """
     keeper, field = _assign_keeper(context, players)
     if keeper is not None:
-        keeper.guard(store.ball_est)
+        keeper.guard(store.ball_est, allow_claim=False)
 
     ball = context.ball
     if ball is None:
@@ -441,70 +509,41 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
 
 
 def _act_ready(context: Context, players: list[Player]) -> None:
-    """READY: each player walks to its ready position."""
+    """READY: the fixed keeper takes its goal, the field players take kickoff
+    positions.
+
+    Role-aware so the keeper starts in goal instead of having to sprint back
+    when play resumes (the old version assigned spots by list order, which put
+    a field player in goal and the keeper upfield). Field slots depend on
+    whether it's our kickoff.
+    """
     game = context.game
     our_kickoff = game is not None and game.kicking_team == context.team_id
-    field = context.field
-    # Our kickoff: priority positions: (-circle radius, 0), (our goal-area
-    # center, 0), (0, circle radius)
+    field_dims = context.field
+    keeper, field = _assign_keeper(context, players)
+
+    if keeper is not None:
+        keeper.action = "ready:keeper"
+        keeper.walk_to(
+            own_goal_area_center(context),
+            face=0.0, avoid_ball=True, avoid_robots=True,
+        )
+
     if our_kickoff:
-        if len(players) >= 1:
-            p1 = players[0]
-            p1.action = "ready"
-            p1.walk_to(
-                (-field.circle_radius, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 2:
-            p2 = players[1]
-            p2.action = "ready"
-            p2.walk_to(
-                (-field.length / 2.0 + field.goal_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 3:
-            p3 = players[2]
-            p3.action = "ready"
-            p3.walk_to(
-                (-0.5, field.circle_radius + 2),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-    # Opponent's kickoff: priority positions: (-circle radius - 0.5, 0), (our
-    # goal-area center, 0), (our penalty-area line center, 0)
+        # One field player at the center spot to take the kick, one wide.
+        slots = [
+            (-field_dims.circle_radius, 0.0),
+            (-0.5, field_dims.circle_radius + 2.0),
+        ]
     else:
-        if len(players) >= 1:
-            p1 = players[0]
-            p1.action = "ready"
-            p1.walk_to(
-                (-field.circle_radius - 0.5, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 2:
-            p2 = players[1]
-            p2.action = "ready"
-            p2.walk_to(
-                (-field.length / 2.0 + field.goal_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
-        if len(players) >= 3:
-            p3 = players[2]
-            p3.action = "ready"
-            p3.walk_to(
-                (-field.length / 2.0 + field.penalty_area_length, 0.0),
-                face=0.0,
-                avoid_ball=True,
-                avoid_robots=True,
-            )
+        # Both field players drop into our half, ahead of the keeper.
+        slots = [
+            (-field_dims.circle_radius - 0.5, 0.0),
+            (-field_dims.length / 2.0 + field_dims.penalty_area_length, 0.0),
+        ]
+    for p, target in zip(field, slots):
+        p.action = "ready"
+        p.walk_to(target, face=0.0, avoid_ball=True, avoid_robots=True)
 
 
 
