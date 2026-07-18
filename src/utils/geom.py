@@ -75,6 +75,30 @@ def clamp_inside_field(
     return (clamp(x, -half_l, half_l), clamp(y, -half_w, half_w))
 
 
+def push_clear_of_ball(
+    target: tuple[float, float],
+    ball_x: float,
+    ball_y: float,
+    clear: float,
+) -> tuple[float, float]:
+    """Ensure ``target`` is at least ``clear`` meters from the ball, pushing it
+    radially away from the ball if it's too close.
+
+    Used when defending an opponent's set play: any position we send a defender
+    to must respect the keep-clear distance, or it's a send-off. If the target
+    is already legal it's returned unchanged; otherwise it's projected outward
+    along the ball->target direction to exactly ``clear`` (or straight back
+    toward our own goal when the target coincides with the ball)."""
+    tx, ty = target
+    dx, dy = tx - ball_x, ty - ball_y
+    d = math.hypot(dx, dy)
+    if d >= clear:
+        return target
+    if d < 1e-6:
+        return (ball_x - clear, ball_y)          # degenerate: push toward our goal (-x)
+    return (ball_x + dx / d * clear, ball_y + dy / d * clear)
+
+
 def defensive_screen_spot(
     ctx: Context,
     ball_x: float,

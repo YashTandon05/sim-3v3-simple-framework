@@ -27,13 +27,25 @@ from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
 from .player import Player
 from .utils import (
+    clamp,
     defensive_screen_spot,
     dist,
     opponent_goal,
     own_goal,
     own_goal_area_center,
 )
-from .utils.tactics import POSSESSION_OURS, POSSESSION_THEIRS, read_possession
+from .utils.tactics import (
+    POSSESSION_OURS,
+    POSSESSION_THEIRS,
+    attacking_corner_target,
+    best_pass_target,
+    build_out_spot,
+    marking_assignment,
+    open_side,
+    pass_lane_clear,
+    read_possession,
+    set_play_defense_assignment,
+)
 from .utils.worldmodel import BallTracker
 
 
@@ -406,8 +418,18 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
                 p.action = "defend_deep"
                 p.support(SUPPORT_DEEP_DIST_M)
             else:
-                p.action = "cover"
-                p.support()
+                # Man-mark the 2nd-most-dangerous opponent if it has advanced
+                # into our third; otherwise hold zonal second-line cover.
+                mark = (
+                    marking_assignment(context, context.ball.x, context.ball.y, MARK_DIST_M)
+                    if context.ball is not None else None
+                )
+                if mark is not None:
+                    p.action = "mark"
+                    p.move_to_position(mark)
+                else:
+                    p.action = "cover"
+                    p.support()
         elif pass_active and p.id != getattr(store, "pass_from_id", None):
             p.action = "receive"
             p.attack()
@@ -420,8 +442,14 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
 
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """OUR_KICKOFF: fixed keeper guards; among the field players, lock in
-    whoever is closest to the ball as the kicker; the rest hold position."""
+    """OUR_KICKOFF: keep possession with a designed diagonal pass.
+
+    Instead of booting the ball straight into the opponent half (where their
+    keeper collects it), the taker plays a controlled pass into space on the
+    supporter's (open) wing, and the supporter runs onto it once play opens.
+    The fixed keeper guards. The pass is armed via ``store.pass_active_*`` so the
+    receiver commits to collecting it as play transitions to NORMAL.
+    """
     keeper, field = _assign_keeper(context, players)
     if keeper is not None:
         keeper.guard(store.ball_est)
@@ -434,18 +462,29 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         # Just entered the kickoff phase, reselect the kicker
         store.kickoff_taker = _select_closest_attacker(context, field).id
 
-    kicker = next((p for p in field if p.id == store.kickoff_taker), None)
-    if kicker is None:
+    taker = next((p for p in field if p.id == store.kickoff_taker), None)
+    if taker is None:
         return
+    supporter = next((p for p in field if p is not taker), None)
 
-    kicker.action = "kickoff"
-    kicker.kick(0.1, KICK_POWER_OUR_KICKOFF)
+    # Diagonal pass into space on the supporter's side (its y sign = the wing it
+    # is waiting on), forward into the opponent half so the restart is legal.
+    side = 1.0
+    if supporter is not None and supporter.pose is not None:
+        side = 1.0 if supporter.pose.y >= 0.0 else -1.0
+    pass_target = (KICKOFF_PASS_AHEAD_M, side * KICKOFF_PASS_WIDE_M)
 
-    for p in field:
-        if p is kicker:
-            continue
-        p.action = "stay"
-        p.stop()
+    taker.action = "kickoff:pass"
+    taker.deliver(pass_target, KICKOFF_PASS_POWER)
+    if taker.is_kicking and supporter is not None:
+        store.pass_active_until = context.now + PASS_RECEIVE_WINDOW_S
+        store.pass_from_id = taker.id
+
+    # Supporter stays legal (own half, outside the circle) on its wing, ready to
+    # sprint onto the pass the instant play opens up.
+    if supporter is not None:
+        supporter.action = "kickoff:outlet"
+        supporter.move_to_position((-0.4, side * KICKOFF_PASS_WIDE_M))
 
 
 def _act_opp_kickoff(context: Context, players: list[Player], store) -> None:
@@ -462,30 +501,176 @@ def _act_opp_kickoff(context: Context, players: list[Player], store) -> None:
         p.walk_to(target, avoid_ball=True, avoid_robots=True)
 
 
+def _arm_pass(context: Context, store, passer_id: int) -> None:
+    """Open the receiver window for a set-play pass just played by ``passer_id``
+    (the other field player collects it as play transitions to NORMAL)."""
+    store.pass_active_until = context.now + PASS_RECEIVE_WINDOW_S
+    store.pass_from_id = passer_id
+
+
+def _setplay_pass_power(bx: float, by: float, target: tuple[float, float]) -> float:
+    """Distance-calibrated, deliberately soft power for a set-play pass."""
+    d = dist(bx, by, target[0], target[1])
+    return clamp(PASS_POWER_MIN + PASS_POWER_PER_M * d, PASS_POWER_MIN, PASS_POWER_MAX)
+
+
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
-    """OUR_SET_PLAY: dispatch by set-play type. TODO: add dedicated logic; currently defaults to _act_normal."""
+    """OUR_SET_PLAY: a dedicated designed restart per set-play type.
+
+    The fixed keeper always guards. Among the field players, the one closest to
+    the ball is the taker; the other supports. Dispatch:
+    - PENALTY_KICK: taker shoots a corner away from their keeper; others hold back.
+    - CORNER_KICK: taker crosses to the near-post area, supporter crashes it.
+    - GOAL_KICK: play out wide to the supporter, else clear up the open wing.
+    - DIRECT_FREE_KICK: shoot if there's an angle, else pass/carry (like open play).
+    - INDIRECT_FREE_KICK / THROW_IN (no direct goal): force a pass to a teammate.
+    """
+    keeper, field = _assign_keeper(context, players)
+    if keeper is not None:
+        keeper.guard(store.ball_est)
+
+    if not field:
+        store.normal_attacker = None
+        return
+
+    ball = context.ball
+    if ball is None:
+        for p in field:
+            p.action = "our_setplay:hold"
+            p.stop()
+        return
+
     set_play = get_set_play_type(context)
-    if set_play == SetPlay.THROW_IN:
-        _act_normal(context, players, store)
-        return
-    if set_play == SetPlay.CORNER_KICK:
-        _act_normal(context, players, store)
-        return
-    if set_play == SetPlay.GOAL_KICK:
-        _act_normal(context, players, store)
-        return
-    _act_normal(context, players, store)
+    taker = _select_closest_attacker(context, field, getattr(store, "normal_attacker", None))
+    store.normal_attacker = taker.id
+    supporter = next((p for p in field if p is not taker), None)
+
+    if set_play == SetPlay.PENALTY_KICK:
+        _our_penalty(context, taker, supporter)
+    elif set_play == SetPlay.CORNER_KICK:
+        _our_corner(context, taker, supporter, store)
+    elif set_play == SetPlay.GOAL_KICK:
+        _our_goal_kick(context, taker, supporter, store)
+    elif set_play == SetPlay.DIRECT_FREE_KICK:
+        _our_direct_free_kick(context, taker, supporter, store)
+    else:
+        # INDIRECT_FREE_KICK, THROW_IN: cannot score directly -> must pass first.
+        _our_indirect(context, taker, supporter, store)
+
+
+def _our_penalty(context: Context, taker: Player, supporter: Player | None) -> None:
+    """Our penalty: the taker shoots at the open corner (``attack`` aims away
+    from their keeper); the supporter waits behind the ball, out of the area."""
+    taker.action = "penalty:shoot"
+    taker.attack()
+    if supporter is not None:
+        supporter.action = "penalty:wait"
+        supporter.move_to_position((-0.5, 1.5))
+
+
+def _our_corner(context: Context, taker: Player, supporter: Player | None, store) -> None:
+    """Our corner: deliver a cross to the near-post danger area; the supporter
+    crashes the box to attack it (and armed as the pass receiver)."""
+    target = attacking_corner_target(context, context.ball.y)
+    taker.action = "corner:cross"
+    taker.deliver(target, CORNER_DELIVERY_POWER)
+    if taker.is_kicking:
+        _arm_pass(context, store, taker.id)
+    if supporter is not None:
+        supporter.action = "corner:crash"
+        supporter.crash_net()
+
+
+def _our_goal_kick(context: Context, taker: Player, supporter: Player | None, store) -> None:
+    """Our goal kick: play out to a wide outlet if the lane is clear, else clear
+    up the open wing (never square across our own goal)."""
+    ball = context.ball
+    spot = build_out_spot(context)
+    if supporter is not None:
+        supporter.action = "goalkick:outlet"
+        supporter.move_to_position(spot)
+
+    if (
+        supporter is not None
+        and pass_lane_clear(context, ball.x, ball.y, spot[0], spot[1], PASS_LANE_RADIUS_M)
+    ):
+        taker.action = "goalkick:pass"
+        taker.deliver(spot, _setplay_pass_power(ball.x, ball.y, spot))
+        if taker.is_kicking:
+            _arm_pass(context, store, taker.id)
+    else:
+        side = open_side(context)
+        clear_target = (0.0, side * (context.field.width / 2.0 - 1.0))
+        taker.action = "goalkick:clear"
+        taker.deliver(clear_target, KICK_POWER_CLEAR)
+
+
+def _our_direct_free_kick(
+    context: Context, taker: Player, supporter: Player | None, store,
+) -> None:
+    """Our direct free kick: shoot if there's an angle (a direct FK can score),
+    else pass/carry as in open play. Supporter crashes if a shot is on, else
+    holds an advanced outlet."""
+    taker.action = "freekick:direct"
+    taker.attack()
+    if getattr(taker, "_kick_intent", None) == "pass":
+        _arm_pass(context, store, taker.id)
+    if supporter is not None:
+        if _ball_in_shot_range(context):
+            supporter.action = "freekick:crash"
+            supporter.crash_net()
+        else:
+            supporter.action = "freekick:outlet"
+            supporter.support_attack()
+
+
+def _our_indirect(
+    context: Context, taker: Player, supporter: Player | None, store,
+) -> None:
+    """Our indirect free kick / throw-in: no direct goal, so force a pass to an
+    open teammate (who can then shoot in open play). If no clear pass exists,
+    nudge the ball into space up-field so a teammate can take the second touch —
+    never a wasted direct shot."""
+    ball = context.ball
+    if supporter is not None:
+        supporter.action = "setplay:outlet"
+        supporter.support_attack()
+
+    target = best_pass_target(
+        context, ball.x, ball.y, taker.id, KEEPER_PLAYER_ID,
+        0.0, PASS_LANE_RADIUS_M,
+    )
+    if target is None and supporter is not None and supporter.pose is not None:
+        cand = (supporter.pose.x, supporter.pose.y)
+        if pass_lane_clear(context, ball.x, ball.y, cand[0], cand[1], PASS_LANE_RADIUS_M):
+            target = cand
+
+    if target is not None:
+        taker.action = "setplay:pass"
+        taker.deliver(target, _setplay_pass_power(ball.x, ball.y, target))
+    else:
+        # No clear pass: a short controlled ball toward goal so a teammate can
+        # take the required second touch (keeps it legal and in play).
+        goal = opponent_goal(context)
+        gd = math.atan2(goal[1] - ball.y, goal[0] - ball.x)
+        target = (ball.x + math.cos(gd) * 2.0, ball.y + math.sin(gd) * 2.0)
+        taker.action = "setplay:nudge"
+        taker.deliver(target, KICK_POWER_CARRY)
+    if taker.is_kicking:
+        _arm_pass(context, store, taker.id)
 
 
 def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
-    """Opponent's set play (free kick / corner / goal kick / throw-in).
+    """Opponent's set play — defend legally (never breach the keep-clear
+    distance to the ball, or it's a 30s send-off + retake).
 
-    Rules: defending robots must keep the required distance from the ball, or
-    they're sent off for 30s and the set piece is retaken. So we do NOT chase.
-    The fixed keeper guards, and every field player retreats to a legal,
-    goal-side screening spot at least ``SET_PLAY_KEEP_CLEAR_M`` from the ball.
-    This replaces the old behavior (delegating to normal play), which sent our
-    nearest player straight at the ball and drew repeated send-offs.
+    The fixed keeper guards (no claiming — an early touch is a severe foul).
+    Dispatch by where the restart is:
+    - PENALTY_KICK: only the keeper defends; field players wait behind the mark.
+    - Ball in OUR half (corner / deep free kick / deep throw): man-mark opponents
+      past halfway goal-side, spare defender guards the goal mouth for the cross.
+    - Ball in THEIR half (goal kick / high free kick / throw): compact mid-block,
+      screening the lane to our goal at a legal distance.
     """
     keeper, field = _assign_keeper(context, players)
     if keeper is not None:
@@ -499,8 +684,31 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
             p.stop()
         return
 
+    set_play = get_set_play_type(context)
+
+    if set_play == SetPlay.PENALTY_KICK:
+        # Only the keeper defends a penalty; field players wait behind the mark,
+        # well clear of the ball and outside the area, ready to counter a save.
+        slots = [(-0.5, -1.5), (-0.5, 1.5)]
+        for p, target in zip(field, slots):
+            p.action = "opp_penalty:wait"
+            p.walk_to(target, face=0.0, avoid_ball=True, avoid_robots=True)
+        return
+
+    if ball.x < 0.0:
+        # Corner / deep free kick / deep throw: man-mark + guard the box.
+        defenders = [(p.id, p.pose.x, p.pose.y) for p in field]
+        assignment = set_play_defense_assignment(
+            context, defenders, MARK_DIST_M, (ball.x, ball.y), SET_PLAY_KEEP_CLEAR_M,
+        )
+        for p, (target, label) in zip(field, assignment):
+            p.action = label
+            p.move_to_position(target)
+        return
+
+    # Ball in their half: compact mid-block screening the lane to our goal.
     for i, p in enumerate(field):
-        p.action = "opp_setplay:retreat"
+        p.action = "opp_setplay:screen"
         target = defensive_screen_spot(
             context, ball.x, ball.y, i, len(field),
             clear=SET_PLAY_KEEP_CLEAR_M, spread=SET_PLAY_DEFENDER_SPREAD_M,

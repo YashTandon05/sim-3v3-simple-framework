@@ -160,9 +160,30 @@ BALL_COLLECT_DIST_M = 0.6         # ball counts as collected once a (non-passing
 # --- Possession / pressure (QW5) ---
 # Retain the ball rather than boot it away: only CLEAR when genuinely pressured
 # AND deep; otherwise carry (dribble) or pass to keep possession.
-PRESSURE_DIST_M = 1.5              # an opponent within this of the ball = we're under pressure
+PRESSURE_DIST_M = 1.8             # an opponent within this of the ball = we're under pressure (raised 1.5->1.8 to react earlier, since reorienting to kick is slow)
 DANGER_RADIUS_M = 3.5             # ball within this of our own goal = danger zone (clear under pressure; escalate defense)
 SUPPORT_DEEP_DIST_M = 1.3         # tight second-line distance from the ball when defending inside the danger zone
+
+# --- Pressure escape / marking / adaptive outlet (QW7) ---
+# Reorienting to kick is slow, so under pressure RELEASE fast: prefer a pass that
+# needs little turn from the current heading; else kick into open space in the
+# least-turn direction. Only DRIBBLE (defender-avoiding carry) when not pressured.
+QUICK_PASS_MAX_TURN_DEG = 60      # under pressure, only pass if it needs <= this turn (quick release)
+ESCAPE_AVOID_RADIUS_M = 0.5       # escape lookahead blocked if an opponent is within this of it
+ESCAPE_LOOK_M = 1.2              # escape/carry lookahead distance
+KICK_POWER_ESCAPE = 4.5          # quick release into space under pressure
+CARRY_AVOID_RADIUS_M = 0.55      # dribble deflects around an opponent within this of the path
+CARRY_LOOK_M = 1.2
+DIR_SCAN_STEP_DEG = 20           # direction-scan step for escape/carry
+DIR_SCAN_MAX_DEG = 80            # max deflection from heading/goal for escape/carry
+
+MARK_DIST_M = 0.9               # 2nd defender marks this far goal-side of the marked opponent (only if it's in our third)
+
+# Fast break + adaptive outlet depth
+OVERCOMMIT_LINE_X = 0.0          # opponents "over-committed" when >= COUNT are on our side of this x
+OVERCOMMIT_MIN_COUNT = 2
+OUTLET_AHEAD_MIN_M = 1.0         # outlet drops this close ahead when building from deep (retain)
+OUTLET_AHEAD_MAX_M = 3.5         # outlet pushes this far ahead when attacking / on the break
 
 
 # ======================================================================
@@ -186,6 +207,33 @@ OPP_SET_WALL_DIST_M = 2.0 # Distance beyond which we block during the opponent's
 # different penalty and not this distance.
 SET_PLAY_KEEP_CLEAR_M = 1.7
 SET_PLAY_DEFENDER_SPREAD_M = 0.8  # Lateral spacing between retreating defenders (m)
+
+
+# ======================================================================
+# Set pieces — designed restarts (kickoff + our/opp set plays)
+# ======================================================================
+
+# --- Our kickoff: keep possession ---
+# Instead of booting the ball straight into the opponent half (gifted to their
+# keeper), play a designed diagonal pass into space on the supporter's (open)
+# wing so we retain possession and immediately build an attack.
+KICKOFF_PASS_AHEAD_M = 1.5      # forward (into opp half) component of the kickoff pass target
+KICKOFF_PASS_WIDE_M = 2.0       # lateral component, toward the supporter's (open) wing
+KICKOFF_PASS_POWER = 4.5        # controlled pass, not a boot
+
+# --- Our attacking set plays ---
+# Corner: deliver a cross to the near-post danger area where the second field
+# player (crasher) attacks it — a direct corner shot is geometrically hopeless
+# for these robots, so we always cross.
+CORNER_DELIVERY_DEPTH_M = 2.0   # cross to this far in front of the opp goal line
+CORNER_DELIVERY_WIDE_M = 1.0    # ...and this far to the near-post (corner) side
+CORNER_DELIVERY_POWER = 5.0
+
+# --- Defending set plays (opponent's) ---
+# Cross defense (opponent corner / deep free kick / deep throw): man-mark
+# opponents past halfway goal-side; any spare defender guards the goal mouth.
+BOX_GUARD_DEPTH_M = 1.6         # box defenders hold this far in front of our goal line
+BOX_GUARD_SPREAD_M = 1.6        # lateral spread of box defenders across the goal mouth
 
 
 # ======================================================================

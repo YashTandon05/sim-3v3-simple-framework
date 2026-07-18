@@ -13,8 +13,14 @@ from __future__ import annotations
 import math
 
 from ..framework.types import Context
-from ..param import POSSESSION_MARGIN_M
-from .geom import clamp, opponent_goal
+from ..param import (
+    BOX_GUARD_DEPTH_M,
+    BOX_GUARD_SPREAD_M,
+    CORNER_DELIVERY_DEPTH_M,
+    CORNER_DELIVERY_WIDE_M,
+    POSSESSION_MARGIN_M,
+)
+from .geom import clamp, normalize_angle, opponent_goal, push_clear_of_ball
 
 
 __all__ = [
@@ -28,6 +34,18 @@ __all__ = [
     "best_pass_target",
     "nearest_opponent_dist",
     "safe_pass_target",
+    "quick_pass_target",
+    "escape_direction",
+    "carry_direction",
+    "marking_assignment",
+    "opponents_overcommitted",
+    "adaptive_outlet_ahead",
+    "open_side",
+    "pass_lane_clear",
+    "box_guard_spots",
+    "set_play_defense_assignment",
+    "attacking_corner_target",
+    "build_out_spot",
 ]
 
 
@@ -289,3 +307,306 @@ def safe_pass_target(
         if space > best_space:
             best_space, best = space, cand
     return best
+
+
+# ----------------------------------------------------------------------
+# Pressure escape / marking / adaptive outlet (QW7)
+# ----------------------------------------------------------------------
+
+
+def _opp_positions(context: Context) -> list[tuple[float, float]]:
+    return [
+        (r.pose.x, r.pose.y)
+        for r in context.opponents.values()
+        if r.pose is not None
+    ]
+
+
+def quick_pass_target(
+    context: Context,
+    ball_x: float,
+    ball_y: float,
+    self_id: int,
+    keeper_id: int,
+    heading: float,
+    lane_radius: float,
+    max_turn: float,
+) -> tuple[float, float] | None:
+    """Fastest-release pass: the open teammate whose pass direction is closest
+    to the carrier's current ``heading`` (least reorientation), within
+    ``max_turn`` radians, and not backward toward our own goal. Excludes self /
+    keeper. None if the only options need a big (slow) turn or are blocked.
+    """
+    opp = _opp_positions(context)
+    best: tuple[float, float] | None = None
+    best_dev = math.inf
+    for tid, r in context.teammates.items():
+        if tid == self_id or tid == keeper_id or r.pose is None:
+            continue
+        cand = (r.pose.x, r.pose.y)
+        if cand[0] < ball_x - 0.5:                      # notably behind -> toward our goal, skip
+            continue
+        if not _segment_clear(ball_x, ball_y, cand[0], cand[1], opp, lane_radius):
+            continue
+        pd = math.atan2(cand[1] - ball_y, cand[0] - ball_x)
+        dev = abs(normalize_angle(pd - heading))
+        if dev > max_turn:
+            continue
+        if dev < best_dev:
+            best_dev, best = dev, cand
+    return best
+
+
+def escape_direction(
+    context: Context,
+    ball_x: float,
+    ball_y: float,
+    heading: float,
+    goal_dir: float,
+    avoid_radius: float,
+    look: float,
+    scan_step_deg: float,
+    scan_max_deg: float,
+) -> float | None:
+    """A quick-release kick direction under pressure: the direction closest to
+    the carrier's ``heading`` (least turn) whose short lookahead is clear of
+    opponents, restricted to the forward hemisphere (within 90 deg of
+    ``goal_dir`` — never escape toward our own goal). None if nothing is open.
+    """
+    opp = _opp_positions(context)
+    best: float | None = None
+    best_dev = math.inf
+    n = int(scan_max_deg / scan_step_deg)
+    for i in range(-n, n + 1):
+        d = heading + math.radians(i * scan_step_deg)
+        if abs(normalize_angle(d - goal_dir)) > math.pi / 2.0:
+            continue                                    # not forward -> skip
+        px, py = ball_x + math.cos(d) * look, ball_y + math.sin(d) * look
+        if not _segment_clear(ball_x, ball_y, px, py, opp, avoid_radius):
+            continue
+        dev = abs(normalize_angle(d - heading))
+        if dev < best_dev:
+            best_dev, best = dev, d
+    return best
+
+
+def carry_direction(
+    context: Context,
+    ball_x: float,
+    ball_y: float,
+    goal_dir: float,
+    avoid_radius: float,
+    look: float,
+    scan_step_deg: float,
+    scan_max_deg: float,
+) -> float:
+    """Dribble direction: toward ``goal_dir``, but if an opponent is in the near
+    path, deflect to the nearest clear side. Returns the clear direction closest
+    to ``goal_dir`` (falls back to ``goal_dir`` if nothing is clearer).
+    """
+    opp = _opp_positions(context)
+    if not opp:
+        return goal_dir
+    n = int(scan_max_deg / scan_step_deg)
+    order = [0]
+    for k in range(1, n + 1):
+        order.extend((k, -k))
+    for k in order:
+        d = goal_dir + math.radians(k * scan_step_deg)
+        px, py = ball_x + math.cos(d) * look, ball_y + math.sin(d) * look
+        if _segment_clear(ball_x, ball_y, px, py, opp, avoid_radius):
+            return d
+    return goal_dir
+
+
+def marking_assignment(
+    context: Context, ball_x: float, ball_y: float, mark_dist: float,
+) -> tuple[float, float] | None:
+    """Man-marking spot for the second field defender: goal-side of the most
+    goal-threatening opponent that is NOT the ball-carrier AND is inside our own
+    defensive third (else they aren't a real threat -> None, use zonal cover).
+    """
+    opps = _opp_positions(context)
+    if not opps:
+        return None
+    third_x = -context.field.length / 2.0 + context.field.length / 3.0
+    gx, gy = -context.field.length / 2.0, 0.0
+    carrier = min(opps, key=lambda o: math.hypot(o[0] - ball_x, o[1] - ball_y))
+    threats = [o for o in opps if o is not carrier and o[0] < third_x]
+    if not threats:
+        return None
+    threat = min(threats, key=lambda o: math.hypot(o[0] - gx, o[1] - gy))
+    dx, dy = gx - threat[0], gy - threat[1]
+    d = math.hypot(dx, dy)
+    ux, uy = (dx / d, dy / d) if d > 1e-6 else (-1.0, 0.0)
+    return (threat[0] + ux * mark_dist, threat[1] + uy * mark_dist)
+
+
+def opponents_overcommitted(
+    context: Context, line_x: float, min_count: int,
+) -> bool:
+    """True when at least ``min_count`` opponents have pushed onto our side of
+    ``line_x`` (over-committed) — the cue to fast-break into the space behind them."""
+    count = sum(
+        1 for r in context.opponents.values()
+        if r.pose is not None and r.pose.x < line_x
+    )
+    return count >= min_count
+
+
+def adaptive_outlet_ahead(
+    context: Context,
+    ball_x: float,
+    overcommitted: bool,
+    ahead_min: float,
+    ahead_max: float,
+) -> float:
+    """How far ahead of the ball the attacking outlet should sit. Drops deep
+    (short) when the ball is in our half (retain / offer a safe forward outlet),
+    pushes high (long) as we advance; snaps to max on a fast break."""
+    if overcommitted:
+        return ahead_max
+    half_l = context.field.length / 2.0
+    frac = clamp((ball_x + half_l) / (2.0 * half_l), 0.0, 1.0)  # 0 deep, 1 advanced
+    return ahead_min + (ahead_max - ahead_min) * frac
+
+
+# ----------------------------------------------------------------------
+# Set pieces — designed restarts (kickoff / our + opponent set plays)
+# ----------------------------------------------------------------------
+
+
+def open_side(context: Context) -> float:
+    """The lateral side with fewer opponents (the open side to attack into):
+    ``+1`` (positive y) or ``-1`` (negative y). Ties resolve to ``+1``."""
+    up = sum(
+        1 for r in context.opponents.values()
+        if r.pose is not None and r.pose.y > 0.0
+    )
+    down = sum(
+        1 for r in context.opponents.values()
+        if r.pose is not None and r.pose.y < 0.0
+    )
+    if up > down:
+        return -1.0
+    return 1.0
+
+
+def pass_lane_clear(
+    context: Context, fx: float, fy: float, tx: float, ty: float, radius: float,
+) -> bool:
+    """True if no opponent is within ``radius`` of the segment (fx,fy)->(tx,ty).
+    A public wrapper over the shared lane check, for set-play delivery decisions."""
+    return _segment_clear(fx, fy, tx, ty, _opp_positions(context), radius)
+
+
+def _goal_side_spot(
+    gx: float, gy: float, ox: float, oy: float, mark_dist: float,
+) -> tuple[float, float]:
+    """A point ``mark_dist`` from opponent (ox,oy) toward our goal (gx,gy) —
+    i.e. goal-side of them, denying the pass/shot lane."""
+    dx, dy = gx - ox, gy - oy
+    d = math.hypot(dx, dy)
+    ux, uy = (dx / d, dy / d) if d > 1e-6 else (-1.0, 0.0)
+    return (ox + ux * mark_dist, oy + uy * mark_dist)
+
+
+def box_guard_spots(
+    context: Context, count: int,
+    depth: float = BOX_GUARD_DEPTH_M, spread: float = BOX_GUARD_SPREAD_M,
+) -> list[tuple[float, float]]:
+    """``count`` positions in front of our goal to defend a cross, spread evenly
+    across the goal mouth (a single defender sits central)."""
+    gx = -context.field.length / 2.0
+    x = gx + depth
+    if count <= 0:
+        return []
+    if count == 1:
+        return [(x, 0.0)]
+    return [(x, -spread + 2.0 * spread * (i / (count - 1))) for i in range(count)]
+
+
+def set_play_defense_assignment(
+    context: Context,
+    defenders: list[tuple[int, float, float]],
+    mark_dist: float,
+    ball_xy: tuple[float, float],
+    keep_clear: float,
+) -> list[tuple[tuple[float, float], str]]:
+    """Assign our field defenders for an opponent set play in our half (corner /
+    deep free kick / deep throw).
+
+    Man-mark opponents that have advanced past halfway (goal-side, most
+    dangerous first) — excluding the taker on the ball — and send any spare
+    defender to guard the goal mouth for the cross. Every returned target is at
+    least ``keep_clear`` from the ball (legal, no set-piece send-off).
+
+    ``defenders`` is ``[(id, x, y), ...]``; returns a list aligned to it of
+    ``(target, label)``, where label is ``"mark:setplay"`` or ``"box"``.
+    """
+    gx, gy = -context.field.length / 2.0, 0.0
+    bx, by = ball_xy
+    opps = _opp_positions(context)
+    n = len(defenders)
+    if n == 0:
+        return []
+
+    # Mark opponents past halfway, excluding the taker (nearest opp to the ball).
+    marks: list[tuple[tuple[float, float], str]] = []
+    if opps:
+        taker = min(opps, key=lambda o: math.hypot(o[0] - bx, o[1] - by))
+        cand = [o for o in opps if o is not taker and o[0] < 0.0]
+        cand.sort(key=lambda o: math.hypot(o[0] - gx, o[1] - gy))  # nearest our goal first
+        marks = [
+            (_goal_side_spot(gx, gy, o[0], o[1], mark_dist), "mark:setplay")
+            for o in cand
+        ]
+    marks = marks[:n]
+
+    n_box = n - len(marks)
+    box = [(s, "box") for s in box_guard_spots(context, n_box)]
+    tasks = [
+        (push_clear_of_ball(t, bx, by, keep_clear), lbl)
+        for (t, lbl) in (marks + box)
+    ][:n]
+
+    # Greedy nearest assignment: highest-priority task (mark nearest threat)
+    # first claims its closest free defender, minimizing travel / crossing.
+    result: list[tuple[tuple[float, float], str] | None] = [None] * n
+    used: set[int] = set()
+    for target, lbl in tasks:
+        best_i, best_d = None, math.inf
+        for i, (_did, dx, dy) in enumerate(defenders):
+            if i in used:
+                continue
+            dd = math.hypot(dx - target[0], dy - target[1])
+            if dd < best_d:
+                best_d, best_i = dd, i
+        if best_i is not None:
+            used.add(best_i)
+            result[best_i] = (target, lbl)
+
+    fallback = push_clear_of_ball((gx + BOX_GUARD_DEPTH_M, 0.0), bx, by, keep_clear)
+    return [r if r is not None else (fallback, "box") for r in result]
+
+
+def attacking_corner_target(
+    context: Context, ball_y: float,
+) -> tuple[float, float]:
+    """Where to deliver our corner: a point just in front of the opponent goal
+    on the near-post (corner) side, where the crashing teammate attacks it."""
+    gx = context.field.length / 2.0
+    half_goal = context.field.goal_width / 2.0
+    side = 1.0 if ball_y >= 0.0 else -1.0
+    ty = side * min(CORNER_DELIVERY_WIDE_M, half_goal - 0.2)
+    return (gx - CORNER_DELIVERY_DEPTH_M, ty)
+
+
+def build_out_spot(context: Context) -> tuple[float, float]:
+    """A wide outlet in our half for playing out from a goal kick: up the open
+    wing, around the edge of our defensive third."""
+    half_l = context.field.length / 2.0
+    x = -half_l + context.field.length / 3.0        # our defensive-third boundary
+    side = open_side(context)
+    y = side * (context.field.width / 2.0 - 1.5)
+    return (x, y)

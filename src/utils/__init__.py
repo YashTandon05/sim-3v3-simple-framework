@@ -24,6 +24,7 @@ from .geom import (
     opponent_goal,
     own_goal,
     own_goal_area_center,
+    push_clear_of_ball,
     rad2deg,
 )
 from .obstacles import Obstacle, collect_obstacles, detour
@@ -42,5 +43,6 @@ __all__ = [
     "opponent_goal",
     "own_goal",
     "own_goal_area_center",
+    "push_clear_of_ball",
     "rad2deg",
 ]

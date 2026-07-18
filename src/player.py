@@ -35,11 +35,15 @@ from .utils.geom import (
 from .utils.obstacles import collect_obstacles
 from .utils.path_planner import plan_global_path
 from .utils.tactics import (
+    adaptive_outlet_ahead,
     attacking_outlet_spot,
     best_pass_target,
     best_shot,
+    carry_direction,
+    escape_direction,
     nearest_opponent_dist,
-    safe_pass_target,
+    opponents_overcommitted,
+    quick_pass_target,
 )
 from .utils.worldmodel import goal_line_crossing
 
@@ -692,30 +696,47 @@ class Player:
                 self._kick_intent = "pass"
                 return self._pass_plan(bx, by, target)
 
-        # Pressure + danger assessment (drives clear-vs-retain).
+        # Pressure assessment. Reorienting to kick is slow, so under pressure we
+        # RELEASE fast (near-heading pass, or a quick kick into space) rather
+        # than dribble — a slow turn lets the defender rob us.
         opp_d = nearest_opponent_dist(ctx, bx, by)
         under_pressure = opp_d is not None and opp_d < PRESSURE_DIST_M
-        in_danger = dist(bx, by, *own_goal(ctx)) < DANGER_RADIUS_M
+        goal_dir = angle_to(bx, by, *goal)
+        heading = self.pose.theta
 
-        # 3. Clear only when genuinely pressured near our own goal.
-        if under_pressure and in_danger:
-            self._kick_intent = "clear"
-            direction = angle_to(bx, by, *goal)
-            return (direction, KICK_POWER_CLEAR, self._goal_target_for_direction(direction))
-
-        # 4. Under pressure elsewhere: retention pass to keep the ball.
-        if under_pressure and passing:
-            safe = safe_pass_target(
-                ctx, bx, by, self.id, KEEPER_PLAYER_ID, PASS_LANE_RADIUS_M,
+        if under_pressure:
+            # 3a. Deep + pressured -> clear to safety.
+            if dist(bx, by, *own_goal(ctx)) < DANGER_RADIUS_M:
+                self._kick_intent = "clear"
+                return (goal_dir, KICK_POWER_CLEAR, self._goal_target_for_direction(goal_dir))
+            # 3b. Quick pass to a near-heading open teammate (minimal turn).
+            if passing:
+                qt = quick_pass_target(
+                    ctx, bx, by, self.id, KEEPER_PLAYER_ID, heading,
+                    PASS_LANE_RADIUS_M, math.radians(QUICK_PASS_MAX_TURN_DEG),
+                )
+                if qt is not None:
+                    self._kick_intent = "pass"
+                    return self._pass_plan(bx, by, qt)
+            # 3c. Quick escape into open space (least reorientation).
+            esc = escape_direction(
+                ctx, bx, by, heading, goal_dir,
+                ESCAPE_AVOID_RADIUS_M, ESCAPE_LOOK_M,
+                DIR_SCAN_STEP_DEG, DIR_SCAN_MAX_DEG,
             )
-            if safe is not None:
-                self._kick_intent = "pass"
-                return self._pass_plan(bx, by, safe)
+            if esc is not None:
+                self._kick_intent = "escape"
+                return (esc, KICK_POWER_ESCAPE, self._goal_target_for_direction(esc))
 
-        # 5. Carry: dribble gently toward goal to retain + advance.
+        # 4. Carry: dribble toward goal, steering AROUND any opponent in the near
+        # path (don't walk the ball into a defender).
+        cd = carry_direction(
+            ctx, bx, by, goal_dir,
+            CARRY_AVOID_RADIUS_M, CARRY_LOOK_M,
+            DIR_SCAN_STEP_DEG, DIR_SCAN_MAX_DEG,
+        )
         self._kick_intent = "carry"
-        direction = angle_to(bx, by, *goal)
-        return (direction, KICK_POWER_CARRY, self._goal_target_for_direction(direction))
+        return (cd, KICK_POWER_CARRY, self._goal_target_for_direction(cd))
 
     def _pass_plan(
         self, bx: float, by: float, target: tuple[float, float],
@@ -727,6 +748,33 @@ class Player:
             PASS_POWER_MIN + PASS_POWER_PER_M * d, PASS_POWER_MIN, PASS_POWER_MAX,
         )
         return (direction, power, target)
+
+    def deliver(self, target: tuple[float, float], power: float) -> None:
+        """Set-play delivery: approach behind the ball lined up toward ``target``,
+        then kick straight at it with fixed ``power`` — a *designed* ball
+        (kickoff pass / corner cross / goal kick / free-kick delivery), skipping
+        the open-play shoot/pass/carry decision in :meth:`_decide_kick`.
+
+        Same chase + kick-hysteresis as :meth:`attack` (enter kicking within
+        ENTER of the ball, exit past EXIT), and no ball avoidance so we can
+        reach it. Sets ``_kick_intent='deliver'`` while striking so the dispatch
+        can arm the receiver.
+        """
+        ball = self.context.ball if self.context is not None else None
+        if ball is None or self.pose is None:
+            self.stop()
+            return
+        direction = angle_to(ball.x, ball.y, target[0], target[1])
+        d = dist(self.pose.x, self.pose.y, ball.x, ball.y)
+        self._kicking = d <= (KICK_EXIT_M if self._kicking else KICK_ENTER_M)
+        if self._kicking:
+            self._kick_intent = "deliver"
+            self._draw_kick_target(target)
+            self.kick(direction, power)
+        else:
+            self._kick_intent = None
+            self.release_kick()
+            self.walk_to(_behind_ball(ball.x, ball.y, target, CHASE_BEHIND_M), avoid_ball=False)
 
     def guard(
         self,
@@ -966,9 +1014,16 @@ class Player:
             self.stop()
             return
         opp_ys = [r.pose.y for r in ctx.opponents.values() if r.pose is not None]
+        # Adaptive depth: drop deep (short) to offer a safe forward outlet when
+        # building up; push high on a fast break when opponents over-commit.
+        overcommitted = opponents_overcommitted(
+            ctx, OVERCOMMIT_LINE_X, OVERCOMMIT_MIN_COUNT,
+        )
+        ahead = adaptive_outlet_ahead(
+            ctx, ball.x, overcommitted, OUTLET_AHEAD_MIN_M, OUTLET_AHEAD_MAX_M,
+        )
         target = attacking_outlet_spot(
-            ctx, ball.x, ball.y, opp_ys,
-            SUPPORT_ATTACK_AHEAD_M, SUPPORT_ATTACK_WIDE_M,
+            ctx, ball.x, ball.y, opp_ys, ahead, SUPPORT_ATTACK_WIDE_M,
         )
         self.move_to_position(target)
 
