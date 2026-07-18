@@ -1,18 +1,22 @@
-"""调试可视化汇聚层 —— 策略随手画,框架统一发 ROS MarkerArray。
+"""Debug visualization aggregation layer -- strategy code draws freely, the framework publishes a single ROS MarkerArray.
 
-用法(策略侧,零 ROS 依赖):
+Usage (strategy side, zero ROS dependency):
     from .framework import debugdraw
     debugdraw.point(x, y, rgb=(1,0,0), ns="target")
     debugdraw.arrow(x0, y0, x1, y1, rgb=(0,1,0), ns="heading")
     debugdraw.line([(x0,y0),(x1,y1)], ns="path")
     debugdraw.text(x, y, "chaser", ns="label")
 
-框架侧:agent 在 ROS node 就绪后调 install(node);runtime 每帧 begin_frame()→...→flush()。
-没装(开发机无 ROS / 未 install)时所有绘制调用是 no-op,可安全在任意环境 import。
+Framework side: the agent calls install(node) once the ROS node is ready;
+runtime calls begin_frame()->...->flush() every frame. When not installed
+(dev machine without ROS / install not called), all draw calls are no-ops,
+so this module can be safely imported in any environment.
 
-坐标系:队伍视角场地系(与 context 一致)。Marker 的 frame_id 默认 "world";在
-Booster Studio / RViz 里把 Fixed Frame 设成同名即可看到。我们同时把球/机器人也画出来,
-所以即使没有外部 TF,这套 marker 自成一致的俯视图。
+Coordinate frame: team-perspective field frame (consistent with context).
+Marker frame_id defaults to "world"; in Booster Studio / RViz, set the
+Fixed Frame to the same name to see it. We also draw the ball/robots
+ourselves, so this set of markers forms a self-consistent top-down view
+even without an external TF.
 """
 
 from __future__ import annotations
@@ -21,15 +25,15 @@ import logging
 
 _log = logging.getLogger(__name__)
 
-_FRAME = "world"          # Marker frame_id;Studio 的 Fixed Frame 设成同名
+_FRAME = "world"          # Marker frame_id; set Studio's Fixed Frame to the same name
 _TOPIC = "/soccer/debug"
-_Z = 0.05                 # 画在地面略上方
+_Z = 0.05                 # drawn slightly above the ground
 
-_impl = None              # 由 install() 注入;None = no-op
+_impl = None              # injected by install(); None = no-op
 
 
 def install(node) -> None:
-    """框架注入真实 ROS 发布器(Docker-only)。开发机不调 → 全程 no-op。"""
+    """Framework injects the real ROS publisher (Docker-only). Not called on dev machines -> stays a no-op throughout."""
     global _impl
     try:
         _impl = _RosDrawSink(node)
@@ -65,7 +69,7 @@ def arrow(x0, y0, x1, y1, rgb=(1.0, 1.0, 0.0), ns="arrow") -> None:
 
 
 def line(points, rgb=(0.5, 0.5, 0.5), ns="line") -> None:
-    """points: [(x,y), ...] 折线。"""
+    """points: [(x,y), ...] polyline."""
     if _impl is not None and len(points) >= 2:
         _impl.line(points, rgb, ns)
 
@@ -76,10 +80,10 @@ def text(x, y, s, rgb=(1.0, 1.0, 1.0), ns="text") -> None:
 
 
 class _RosDrawSink:
-    """真实实现:累积本帧 marker,flush 时发一个 MarkerArray(先 DELETEALL 清旧)。"""
+    """Real implementation: accumulates this frame's markers, publishes one MarkerArray on flush (DELETEALL first to clear the old ones)."""
 
     def __init__(self, node) -> None:
-        # 延迟 import,避免开发机无 ROS 时污染
+        # deferred import to avoid polluting dev machines without ROS
         from visualization_msgs.msg import MarkerArray
 
         self._node = node
@@ -101,7 +105,7 @@ class _RosDrawSink:
         arr.markers.extend(self._markers)
         self._pub.publish(arr)
 
-    # -- 各图元 --
+    # -- individual primitives --
 
     def _new(self, ns, mtype):
         from visualization_msgs.msg import Marker
@@ -149,9 +153,9 @@ class _RosDrawSink:
             Point(x=float(x0), y=float(y0), z=_Z),
             Point(x=float(x1), y=float(y1), z=_Z),
         ]
-        m.scale.x = 0.03   # 杆径
-        m.scale.y = 0.08   # 箭头宽
-        m.scale.z = 0.12   # 箭头长
+        m.scale.x = 0.03   # shaft diameter
+        m.scale.y = 0.08   # arrowhead width
+        m.scale.z = 0.12   # arrowhead length
         self._rgba(m, rgb)
         self._markers.append(m)
 
@@ -161,7 +165,7 @@ class _RosDrawSink:
 
         m = self._new(ns, Marker.LINE_STRIP)
         m.points = [Point(x=float(px), y=float(py), z=_Z) for px, py in points]
-        m.scale.x = 0.02   # 线宽
+        m.scale.x = 0.02   # line width
         self._rgba(m, rgb)
         self._markers.append(m)
 
@@ -170,7 +174,7 @@ class _RosDrawSink:
 
         m = self._new(ns, Marker.TEXT_VIEW_FACING)
         m.pose.position.x, m.pose.position.y, m.pose.position.z = float(x), float(y), 0.3
-        m.scale.z = 0.25   # 字高
+        m.scale.z = 0.25   # text height
         self._rgba(m, rgb)
         m.text = str(s)
         self._markers.append(m)

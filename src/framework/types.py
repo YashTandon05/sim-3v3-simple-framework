@@ -1,7 +1,8 @@
-"""核心数据类型 —— 框架的"数据契约层"。
+"""Core data types -- the framework's "data contract layer".
 
-字段定义直接对应 docs/new_design.md 第 9 节。这里不含任何 ROS / boosteros 依赖,
-可独立 import、单测、reload。
+Field definitions map directly to docs/new_design.md section 9. This
+module has no ROS / boosteros dependencies, so it can be imported,
+unit-tested, and reloaded independently.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ KICKING_TEAM_NONE = 255
 
 
 # ----------------------------------------------------------------------
-# 枚举
+# Enums
 # ----------------------------------------------------------------------
 
 
@@ -87,13 +88,13 @@ class Penalty(str, Enum):
 
 
 class KickingTeam(int, Enum):
-    """裁判机 kicking_team 字段的特殊值标记。"""
+    """Marker for the special value of the game controller's kicking_team field."""
 
     NONE = KICKING_TEAM_NONE
 
 
 # ----------------------------------------------------------------------
-# 基础数据类型
+# Basic data types
 # ----------------------------------------------------------------------
 
 
@@ -106,10 +107,10 @@ class Pose2D:
 
 @dataclass(frozen=True)
 class FieldDimensions:
-    """场地几何尺寸,只含数值不含方法。
+    """Field geometry dimensions, values only, no methods.
 
-    几何 helper(opponent_goal 等)放在 stdlib 或用户代码,见 docs/new_design.md
-    第 9.3 节。
+    Geometry helpers (opponent_goal etc.) live in stdlib or user code, see
+    docs/new_design.md section 9.3.
     """
 
     length: float
@@ -137,7 +138,7 @@ ADULT_FIELD_DIMENSIONS = FieldDimensions(
 
 
 # ----------------------------------------------------------------------
-# 观察类型(球 / 机器人 / 裁判机)
+# Observation types (ball / robot / game controller)
 # ----------------------------------------------------------------------
 
 
@@ -211,15 +212,15 @@ class GameControlState:
 
 
 # ----------------------------------------------------------------------
-# Context —— play(context, players, store) 的第一参数
+# Context -- the first argument of play(context, players, store)
 # ----------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Context:
-    """每帧由框架构造的只读快照,作为 play() 的入参。
+    """Read-only snapshot built by the framework every frame, passed as play()'s argument.
 
-    详细字段语义见 docs/new_design.md 第 9 节。
+    See docs/new_design.md section 9 for detailed field semantics.
     """
 
     now: float
@@ -234,10 +235,12 @@ class Context:
 
 @dataclass(frozen=True)
 class WorldSnapshot:
-    """框架内部:数据源每帧提供的原始快照(未做新鲜度过滤)。
+    """Framework-internal: the raw snapshot the data source provides every frame (not yet freshness-filtered).
 
-    数据源(如 ROS 真值)只负责把最新观测填进来并带上 ``last_seen_at``;新鲜度
-    过滤(陈旧→None)由 runtime 在构造 Context 时统一做,见 docs/new_design.md §9.3。
+    The data source (e.g. ROS ground truth) is only responsible for
+    filling in the latest observations along with ``last_seen_at``;
+    freshness filtering (stale -> None) is done uniformly by runtime when
+    constructing Context, see docs/new_design.md section 9.3.
     """
 
     game: GameControlState | None = None

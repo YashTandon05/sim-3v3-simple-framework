@@ -1,14 +1,17 @@
-"""SoccerSim 策略入口 —— 比赛策略主逻辑都在这里,改打法就改这个文件。
+"""SoccerSim strategy entry point — all match strategy logic lives here; change the playbook by editing this file.
 
-结构(由浅入深):
-- main.py(本文件):比赛策略。play() 按 Phase 状态机分派到 _act_*;各 _act_* 选出
-  attacker(离球最近)并直接调 player 动作。
-- player.py:Player 控制 handle + 高层动作(attack / take_kickoff /
-  move_to_position / walk_to);想加拐棍/技术动作直接改它。
-- utils/:走位/几何/避障工具(opponent_goal / dist / angle_to ...)。
-- framework/:平台管线,用户不改。
+Structure (shallow to deep):
+- main.py (this file): match strategy. play() dispatches to _act_* based on the
+  Phase state machine; each _act_* picks the attacker (closest to ball) and
+  calls player actions directly.
+- player.py: the Player control handle + high-level actions (attack /
+  take_kickoff / move_to_position / walk_to); to add new tricks/technical
+  moves, edit this directly.
+- utils/: movement/geometry/avoidance tools (opponent_goal / dist / angle_to ...).
+- framework/: platform pipeline, not meant to be edited by users.
 
-改打法主要改本文件:Phase 状态机、各 _act_* 行为、站位公式。
+To change the playbook, mainly edit this file: the Phase state machine, each
+_act_* behavior, and positioning formulas.
 """
 
 from __future__ import annotations
@@ -23,43 +26,46 @@ from .framework.agent import SoccerAgentMixin
 from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
 from .player import Player
-from .utils import dist, opponent_goal, own_goal
+from .utils import defensive_screen_spot, dist, opponent_goal, own_goal
+from .utils.tactics import POSSESSION_OURS, POSSESSION_THEIRS, read_possession
+from .utils.worldmodel import BallTracker
 
 
 _log = logging.getLogger(__name__)
 
 
 # ======================================================================
-# Phase 状态机 —— 比赛阶段分类
+# Phase state machine — match phase classification
 # ======================================================================
 
 
 class Phase(Enum):
-    """比赛阶段。顶层状态机,决定当前是正常拼抢/开球/定位球/准备/停止。"""
-    NORMAL = "normal"              # PLAYING 正常拼抢
-    OUR_KICKOFF = "our_kickoff"    # 我方开球(SET+PLAYING 初期,take_kickoff)
-    OPP_KICKOFF = "opp_kickoff"    # 对方开球(避让)
-    OUR_SET_PLAY = "our_set_play"  # 我方定位球(任意球/角球/球门球)
-    OPP_SET_PLAY = "opp_set_play"  # 对方定位球(避让)
-    READY = "ready"                # READY 走位
-    STOPPED = "stopped"            # SET(非开球重开) / INITIAL / FINISHED / stopped
+    """Match phase. Top-level state machine determining whether we're currently
+    in normal play / kickoff / set play / ready / stopped."""
+    NORMAL = "normal"              # PLAYING, normal contest
+    OUR_KICKOFF = "our_kickoff"    # Our kickoff (early SET+PLAYING, take_kickoff)
+    OPP_KICKOFF = "opp_kickoff"    # Opponent's kickoff (give way)
+    OUR_SET_PLAY = "our_set_play"  # Our set play (free kick / corner / goal kick)
+    OPP_SET_PLAY = "opp_set_play"  # Opponent's set play (give way)
+    READY = "ready"                # READY positioning
+    STOPPED = "stopped"            # SET (non-kickoff restart) / INITIAL / FINISHED / stopped
 
 
 def get_phase(context: Context) -> Phase:
-    """根据裁判机状态判断当前比赛阶段。"""
+    """Determine the current match phase from the game-controller state."""
     g = context.game
     if g is None:
         return Phase.STOPPED
 
     state = g.state
 
-    # READY:走 ready 位
+    # READY: walk to ready position
     if state == GameState.READY:
         return Phase.READY
 
-    # PLAYING:正常拼抢 or 开球/定位球执行中
+    # PLAYING: normal contest, or a kickoff/set play in progress
     if state == GameState.PLAYING and not g.stopped:
-        # 定位球:set_play != NONE,kicking_team 指示哪方
+        # Set play: set_play != NONE, kicking_team indicates which side
         if g.set_play != SetPlay.NONE and g.kicking_team != KICKING_TEAM_NONE:
             our_team = context.team_id
             if g.kicking_team == our_team:
@@ -67,7 +73,7 @@ def get_phase(context: Context) -> Phase:
             else:
                 return Phase.OPP_SET_PLAY
 
-        # 开球:secondary_time > 0(倒计时窗口),kicking_team 指示哪方
+        # Kickoff: secondary_time > 0 (countdown window), kicking_team indicates which side
         if g.secondary_time > 0 and g.kicking_team != KICKING_TEAM_NONE:
             our_team = context.team_id
             if g.kicking_team == our_team:
@@ -75,26 +81,29 @@ def get_phase(context: Context) -> Phase:
             else:
                 return Phase.OPP_KICKOFF
 
-        # 正常拼抢
+        # Normal contest
         return Phase.NORMAL
 
-    # SET / INITIAL / FINISHED / stopped:站定
+    # SET / INITIAL / FINISHED / stopped: hold position
     return Phase.STOPPED
 
 def get_set_play_type(context: Context) -> SetPlay:
-    """当前生效的定位球类型;无定位球(或无裁判机数据)时返回 ``SetPlay.NONE``。
+    """The currently active set-play type; returns ``SetPlay.NONE`` when there's
+    no set play (or no game-controller data).
 
-    直接读裁判机的 ``set_play`` 字段,不区分是哪方主罚 —— 哪方由 :func:`get_phase`
-    (OUR_SET_PLAY / OPP_SET_PLAY)判定。这里只回答"是什么类型的定位球"。
+    Reads the game controller's ``set_play`` field directly, without
+    distinguishing which side is taking it — that's determined by
+    :func:`get_phase` (OUR_SET_PLAY / OPP_SET_PLAY). This function only answers
+    "what type of set play is it."
 
-    共 7 种可能返回值(见 framework.types.SetPlay):
-    - ``NONE``:无定位球(正常比赛/开球等)
-    - ``DIRECT_FREE_KICK``:直接任意球(可直接射门得分)
-    - ``INDIRECT_FREE_KICK``:间接任意球(须先触碰他人才能进球)
-    - ``PENALTY_KICK``:点球
-    - ``THROW_IN``:界外球(踢入)
-    - ``GOAL_KICK``:球门球
-    - ``CORNER_KICK``:角球
+    7 possible return values (see framework.types.SetPlay):
+    - ``NONE``: no set play (normal play / kickoff etc.)
+    - ``DIRECT_FREE_KICK``: direct free kick (can score directly)
+    - ``INDIRECT_FREE_KICK``: indirect free kick (must touch another player before scoring)
+    - ``PENALTY_KICK``: penalty kick
+    - ``THROW_IN``: throw-in (kicked in)
+    - ``GOAL_KICK``: goal kick
+    - ``CORNER_KICK``: corner kick
     """
     g = context.game
     if g is None:
@@ -103,21 +112,24 @@ def get_set_play_type(context: Context) -> SetPlay:
 
 
 # ======================================================================
-# Agent 入口
+# Agent entry point
 # ======================================================================
 
 
 class SoccerSimAgent(SoccerAgentMixin, AgentBase):
-    """3v3 SoccerSim agent。"""
+    """3v3 SoccerSim agent."""
 
     player_class = Player
 
     def init_store(self, store) -> None:
         _log.info("init_store called")
-        store.prev_phase = None       # 上一帧 phase,用于检测 phase 跳变(边沿)
+        store.prev_phase = None       # Previous frame's phase, used to detect phase transitions (edges)
         store.cur_phase = None
-        store.kickoff_taker = None    # 锁定的开球主罚球员 id(每次进入开球时重选)
+        store.kickoff_taker = None    # Locked-in kickoff taker player id (reselected each time we enter a kickoff)
         store.normal_attacker = None
+        store.ball_tracker = BallTracker()  # Cross-frame ball velocity estimator (world-model foundation)
+        store.ball_est = None               # This frame's ball position+velocity estimate (updated every play() call)
+        store.defend_mode = False           # Team mode: True = press+cover (opp has ball in our half), False = attack+outlet
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -125,11 +137,24 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.prev_phase = store.cur_phase
         store.cur_phase = phase
 
-        # 画可视化(每帧)
+        # World model: update ball velocity estimate every frame (used by
+        # goalkeeper saves / future interception logic).
+        store.ball_est = store.ball_tracker.update(context.ball)
+
+        # Draw visualization (every frame)
         _analyze_and_draw(context, players, store)
 
-        # 当前 phase 以 label 画在场外。
+        # Draw the current phase as a label outside the field.
         from .framework import debugdraw
+
+        # Ball velocity vector (orange arrow): visually verify estimated
+        # direction/magnitude.
+        est = store.ball_est
+        if est is not None and est.moving:
+            debugdraw.arrow(
+                est.x, est.y, est.x + est.vx * 0.5, est.y + est.vy * 0.5,
+                rgb=(1.0, 0.5, 0.0), ns="ball_vel",
+            )
         g = context.game
         game_state = g.state.value if g is not None else "none"
         set_play = g.set_play.value if g is not None else "none"
@@ -140,25 +165,29 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
 
-        # 活性自理 + 过滤出本帧可行动的球员。
-        # ensure_ready:摔倒起身 / 切 walk 模式(异步,不产生移动);被罚下的也做,
-        # 这样解罚后能立刻投入。被罚下或未就绪的不参与分派(也不进角色分配,避免把
-        # 动不了的人选成 attacker 导致该帧无人进攻)。
+        # Self-recovery + filter down to players that can act this frame.
+        # ensure_ready: fallen -> get up / switch to walk mode (async, doesn't
+        # produce movement); also done for penalized players so they can jump
+        # right back in once the penalty clears. Penalized or not-yet-ready
+        # players don't take part in dispatch (or role assignment), so we
+        # never pick an immobile player as attacker and leave nobody attacking
+        # this frame.
         active: list[Player] = []
         for p in players:
             ready = p.ensure_ready()
             if p.is_penalized:
-                p.action = "penalized"     # 罚下:可起身/切模式,但不能移动
+                p.action = "penalized"     # Penalized: can get up / switch modes, but cannot move
                 p.stop()
             elif not ready:
                 p.action = "fallen" if p.is_fallen else "switching_mode"
             elif p.pose is None:
-                p.action = "no_pose"       # 自己位置未知:不参与分派(下游按 pose 已知处理)
+                p.action = "no_pose"       # Own position unknown: doesn't take part in dispatch (downstream treats pose as known)
                 p.stop()
             else:
                 active.append(p)
 
-        # 按 phase 对整队分派一次(角色分配等全队计算只在 _act_* 里算一次)。
+        # Dispatch the whole team once per phase (team-wide computations like
+        # role assignment are only done once inside each _act_*).
         if phase == Phase.NORMAL:
             _act_normal(context, active, store)
         elif phase == Phase.OUR_KICKOFF:
@@ -166,7 +195,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             _act_our_kickoff(context, active, store)
         elif phase == Phase.OPP_KICKOFF:
             _clear_normal_sticky(store)
-            _act_opp_kickoff(context, active)
+            _act_opp_kickoff(context, active, store)
         elif phase == Phase.OUR_SET_PLAY:
             _clear_normal_sticky(store)
             _act_our_set_play(context, active, store)
@@ -182,8 +211,9 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
                 p.action = "stopped"
                 p.stop()
 
-        # 队员可视化统一在最后画一遍:覆盖所有球员(含判罚/未就绪/STOPPED),
-        # 修复 SET 等状态下红球/标签消失的问题。
+        # Draw teammate visualization uniformly at the end: covers all
+        # players (including penalized/not-ready/STOPPED), fixing the issue
+        # where the red ball marker/label disappears in states like SET.
         for p in players:
             _draw_teammate_marker(p)
 
@@ -193,7 +223,7 @@ def _clear_normal_sticky(store) -> None:
 
 
 def _player_dist_to_ball(context: Context, p: Player) -> float:
-    """球员到球当前位置的距离。"""
+    """Distance from a player to the ball's current position."""
     ball = context.ball
     return (
         dist(p.pose.x, p.pose.y, ball.x, ball.y) + _fallen_time_cost(p)
@@ -210,9 +240,10 @@ def _select_closest_attacker(
     players: list[Player],
     preferred_id: int | None = None,
 ) -> Player:
-    """选到球距离最小的球员。
+    """Select the player with the smallest distance to the ball.
 
-    ``players`` 非空、已就绪、pose 已知。normal 与开球共用。
+    ``players`` is non-empty, ready, and has a known pose. Shared by normal
+    play and kickoffs.
     """
     ranked = [(p, _player_dist_to_ball(context, p)) for p in players]
     best, best_dist = min(ranked, key=lambda item: item[1])
@@ -225,83 +256,146 @@ def _select_closest_attacker(
     return best
 
 
-def _act_normal(context: Context, players: list[Player], store) -> None:
-    """NORMAL:距球最近者 attack,剩下人里离己方门最近者 guard,其余 support。
+def _assign_keeper(
+    context: Context, active: list[Player],
+) -> tuple[Player | None, list[Player]]:
+    """Split the actionable players into (keeper, field_players).
 
-    ``players`` 是本帧可行动球员(已就绪、pose 已知),这里直接挑角色并执行。
+    The keeper is the fixed ``KEEPER_PLAYER_ID`` whenever that robot is
+    available this frame; if it's penalized / fallen / pose-unknown (not in
+    ``active``), the closest active player to our goal is promoted so the net
+    is never abandoned. With only one player available, nobody is pinned in
+    goal — the lone survivor plays as a field player.
+
+    ``field_players`` is ``active`` minus the keeper. Used by every phase so
+    the same robot stays in goal across normal play, kickoffs, and set plays.
     """
-    if not players:
+    if len(active) <= 1:
+        return None, list(active)
+    keeper = next((p for p in active if p.id == KEEPER_PLAYER_ID), None)
+    if keeper is None:
+        gx, gy = own_goal(context)
+        keeper = min(active, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
+    field = [p for p in active if p is not keeper]
+    return keeper, field
+
+
+def _update_team_mode(context: Context, store) -> None:
+    """Decide DEFEND vs ATTACK mode from possession + ball zone, with hysteresis.
+
+    DEFEND (store.defend_mode = True) only when the opponent has the ball in our
+    half; ATTACK when we have it or the ball is in their half. A "contested"
+    read in our half holds the previous mode, so the second field player doesn't
+    flip between a deep cover spot and an advanced outlet frame to frame.
+    """
+    ball = context.ball
+    if ball is None:
+        return  # keep previous mode
+    if ball.x >= 0.0:
+        store.defend_mode = False                 # ball in their half -> attack
+        return
+    poss = read_possession(context)
+    if poss == POSSESSION_THEIRS:
+        store.defend_mode = True                  # their ball, our half -> defend
+    elif poss == POSSESSION_OURS:
+        store.defend_mode = False                 # our ball, our half -> build up
+    # else contested in our half -> keep previous store.defend_mode
+
+
+def _act_normal(context: Context, players: list[Player], store) -> None:
+    """NORMAL: fixed keeper guards; the two field players take possession-aware
+    dynamic roles.
+
+    The nearer field player always goes for the ball (press when defending,
+    attack when we have it). The other's role depends on team mode:
+    - DEFEND (opp has ball in our half): second-line defensive cover (support()).
+    - ATTACK (we have it, or ball in their half): advanced outlet (support_attack()).
+
+    ``players`` is this frame's set of actionable players (ready, pose known).
+    """
+    keeper, field = _assign_keeper(context, players)
+    if keeper is not None:
+        keeper.guard(store.ball_est)
+
+    if not field:
+        store.normal_attacker = None
         return
 
-    attacker = _select_closest_attacker(
-        context, players, getattr(store, "normal_attacker", None),
+    _update_team_mode(context, store)
+
+    # Debug: show the team mode + possession read near the bottom touchline.
+    from .framework import debugdraw
+    debugdraw.text(
+        0.0, -context.field.width / 2.0 - 0.2,
+        f"mode={'DEFEND' if store.defend_mode else 'ATTACK'} poss={read_possession(context)}",
+        rgb=(0.6, 1.0, 0.6), ns="team_mode",
     )
-    store.normal_attacker = attacker.id
-    attacker.action = "attack"
-    attacker.attack()
 
-    # guard:剩下人里离己方门最近者(如还有人)
-    rest = [p for p in players if p is not attacker]
-    if rest:
-        gx, gy = own_goal(context)
-        guard = min(rest, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
-        guard.guard()  
-        rest = [p for p in rest if p is not guard]
+    primary = _select_closest_attacker(
+        context, field, getattr(store, "normal_attacker", None),
+    )
+    store.normal_attacker = primary.id
+    primary.action = "press" if store.defend_mode else "attack"
+    primary.attack()
 
-    # support:其余全部
-    for p in rest:
-        p.action = "support"
-        p.support()
+    # The other field player(s): defensive cover when defending, advanced
+    # attacking outlet when attacking.
+    for p in field:
+        if p is primary:
+            continue
+        if store.defend_mode:
+            p.action = "cover"
+            p.support()
+        else:
+            p.action = "outlet"
+            p.support_attack()
 
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """OUR_KICKOFF:锁定距离最小者开球,剩下人里离己方门最近者 guard,其余 support。"""
-    if not players:
+    """OUR_KICKOFF: fixed keeper guards; among the field players, lock in
+    whoever is closest to the ball as the kicker; the rest hold position."""
+    keeper, field = _assign_keeper(context, players)
+    if keeper is not None:
+        keeper.guard(store.ball_est)
+
+    if not field:
         return
 
-    active_ids = {p.id for p in players}
-    if store.prev_phase != Phase.OUR_KICKOFF or store.kickoff_taker not in active_ids:
-        # 进入开球阶段，重新选择开球球员
-        store.kickoff_taker = _select_closest_attacker(context, players).id
+    field_ids = {p.id for p in field}
+    if store.prev_phase != Phase.OUR_KICKOFF or store.kickoff_taker not in field_ids:
+        # Just entered the kickoff phase, reselect the kicker
+        store.kickoff_taker = _select_closest_attacker(context, field).id
 
-    attacker_id = store.kickoff_taker
-    attacker = next((p for p in players if p.id == attacker_id), None)
-    if attacker is None:
+    kicker = next((p for p in field if p.id == store.kickoff_taker), None)
+    if kicker is None:
         return
 
-    attacker.action = "kickoff"
-    attacker.kick(0.1, KICK_POWER_OUR_KICKOFF)
+    kicker.action = "kickoff"
+    kicker.kick(0.1, KICK_POWER_OUR_KICKOFF)
 
-    rest = [p for p in players if p is not attacker]
-    if rest:
-        gx, gy = own_goal(context)
-        guard = min(rest, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
-        guard.guard()
-        rest = [p for p in rest if p is not guard]
-
-    for p in rest:
+    for p in field:
+        if p is kicker:
+            continue
         p.action = "stay"
         p.stop()
 
 
-def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
-    """对方开球:一人守门,其余人站到中圈外固定点等待。"""
-    if not players:
-        return
-    gx, gy = own_goal(context)
-    guard = min(players, key=lambda p: dist(p.pose.x, p.pose.y, gx, gy))
-    guard.guard()
+def _act_opp_kickoff(context: Context, players: list[Player], store) -> None:
+    """Opponent's kickoff: fixed keeper guards; field players hold fixed
+    positions in our half, outside the center circle (staying clear of the ball)."""
+    keeper, field = _assign_keeper(context, players)
+    if keeper is not None:
+        keeper.guard(store.ball_est)
 
-    rest = [p for p in players if p is not guard]
     r = context.field.circle_radius
     slots = [(-r - 0.5, 0.0), (-r - 2.0, 0.5)]
-    for p, target in zip(rest, slots):
+    for p, target in zip(field, slots):
         p.action = "opp_kickoff:ready"
         p.walk_to(target, avoid_ball=True, avoid_robots=True)
 
 
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
-    """OUR_SET_PLAY:按定位球类型分派, TODO：加入自己的逻辑。默认为 _act_normal"""
+    """OUR_SET_PLAY: dispatch by set-play type. TODO: add dedicated logic; currently defaults to _act_normal."""
     set_play = get_set_play_type(context)
     if set_play == SetPlay.THROW_IN:
         _act_normal(context, players, store)
@@ -316,16 +410,43 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
 
 
 def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
-    """对方开球： TODO: 实现自己的逻辑。默认与 Normal 相同"""
-    _act_normal(context, players, store)
+    """Opponent's set play (free kick / corner / goal kick / throw-in).
+
+    Rules: defending robots must keep the required distance from the ball, or
+    they're sent off for 30s and the set piece is retaken. So we do NOT chase.
+    The fixed keeper guards, and every field player retreats to a legal,
+    goal-side screening spot at least ``SET_PLAY_KEEP_CLEAR_M`` from the ball.
+    This replaces the old behavior (delegating to normal play), which sent our
+    nearest player straight at the ball and drew repeated send-offs.
+    """
+    keeper, field = _assign_keeper(context, players)
+    if keeper is not None:
+        keeper.guard(store.ball_est)
+
+    ball = context.ball
+    if ball is None:
+        # Ball position unknown: hold still rather than risk drifting too close.
+        for p in field:
+            p.action = "opp_setplay:hold"
+            p.stop()
+        return
+
+    for i, p in enumerate(field):
+        p.action = "opp_setplay:retreat"
+        target = defensive_screen_spot(
+            context, ball.x, ball.y, i, len(field),
+            clear=SET_PLAY_KEEP_CLEAR_M, spread=SET_PLAY_DEFENDER_SPREAD_M,
+        )
+        p.walk_to(target, avoid_ball=True, avoid_robots=True)
 
 
 def _act_ready(context: Context, players: list[Player]) -> None:
-    """READY:各自走 ready 位。"""
+    """READY: each player walks to its ready position."""
     game = context.game
     our_kickoff = game is not None and game.kicking_team == context.team_id
     field = context.field
-    # 我方开球：优先级站位：(-中圈半径, 0), (我方 goal area 中心点，0)， （0， 中圈半径）
+    # Our kickoff: priority positions: (-circle radius, 0), (our goal-area
+    # center, 0), (0, circle radius)
     if our_kickoff:
         if len(players) >= 1:
             p1 = players[0]
@@ -354,7 +475,8 @@ def _act_ready(context: Context, players: list[Player]) -> None:
                 avoid_ball=True,
                 avoid_robots=True,
             )
-    # 对方开球：优先级站位：(-中圈半径 - 0.5, 0), (我方 goal area 中心点，0)， （我方禁区线中心点， 0)
+    # Opponent's kickoff: priority positions: (-circle radius - 0.5, 0), (our
+    # goal-area center, 0), (our penalty-area line center, 0)
     else:
         if len(players) >= 1:
             p1 = players[0]
@@ -387,15 +509,18 @@ def _act_ready(context: Context, players: list[Player]) -> None:
 
 
 # ======================================================================
-# 战场可视化 —— 显示球位置 + 球员到球的距离,画到 ROS 可视化
+# On-field visualization — show ball position + player-to-ball distances,
+# drawn to the ROS visualizer
 # ======================================================================
 
 def _draw_teammate_marker(p: Player) -> None:
-    """我方队员可视化:红色。踢球中→方块,否则→球体。
+    """Visualize a teammate: red. Cube while kicking, sphere otherwise.
 
-    每帧对所有球员统一调用(不受 phase/判罚/就绪影响)。标签两行:
-    - 上:编号 + 当前高层动作(``p.action``),踢球中追加 ``[KICK]``。
-    - 通过形状(方块 vs 球体)再次区分是否进入 kick 状态。
+    Called uniformly for every player every frame (unaffected by
+    phase/penalty/readiness). Two-line label:
+    - Top: player id + current high-level action (``p.action``), with
+      ``[KICK]`` appended while kicking.
+    - Shape (cube vs. sphere) also distinguishes whether it's in kick state.
     """
     from .framework import debugdraw
 
@@ -412,22 +537,23 @@ def _draw_teammate_marker(p: Player) -> None:
 
 
 def _analyze_and_draw(context: Context, players: list[Player], store) -> None:
-    """每帧:计算球员到球的距离,画可视化。
+    """Every frame: compute player-to-ball distances and draw visualization.
 
-    不再依赖 analysis 模块;距离改为基于球当前位置。
+    No longer depends on the analysis module; distance is now based on the
+    ball's current position.
     """
     from .framework import debugdraw
 
     ball = context.ball
 
-    # 球不可见:无可视化
+    # Ball not visible: no visualization
     if ball is None:
         return
 
-    # 1. 画球当前位置(绿色点)
+    # 1. Draw the ball's current position (green dot)
     debugdraw.point(ball.x, ball.y, rgb=(0.0, 1.0, 0.0), scale=0.2, ns="ball_current")
 
-    # 2. 球员到球的距离:我方(红标签)+ 敌方(蓝标签)
+    # 2. Player-to-ball distances: ours (red labels) + opponents' (blue labels)
     for p in players:
         if p.pose is None:
             continue
@@ -444,4 +570,3 @@ def _analyze_and_draw(context: Context, players: list[Player], store) -> None:
             r.pose.x + 0.3, r.pose.y - 0.3, f"{d:.1f}m",
             rgb=(0.6, 0.6, 1.0), ns="dist_opp",
         )
-

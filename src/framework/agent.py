@@ -1,14 +1,18 @@
-"""SoccerAgent 框架 mixin:用户入口类的框架行为来源。
+"""SoccerAgent framework mixin: the source of framework behavior for the user's entry class.
 
-平台约束:Booster 构建校验只认入口类的【直接基类】是否为
-``booster_agent_framework.AgentBase``,不追溯多层继承。因此框架不能提供一个
-``SoccerAgent(AgentBase)`` 让用户单继承——那样用户类的直接基类是 SoccerAgent,
-校验不过。
+Platform constraint: Booster's build validation only checks whether the
+entry class's *direct base class* is ``booster_agent_framework.AgentBase``;
+it does not walk up multiple levels of inheritance. So the framework can't
+just provide a ``SoccerAgent(AgentBase)`` for the user to single-inherit
+from -- that would make the user class's direct base SoccerAgent, and
+validation would fail.
 
-解法:框架行为放在【不继承 AgentBase】的 mixin 里,用户入口类写成
-``class MyAgent(SoccerAgentMixin, AgentBase)``,让 AgentBase 成为直接基类之一。
+Solution: put the framework behavior in a mixin that does *not* inherit
+from AgentBase, so the user's entry class is written as
+``class MyAgent(SoccerAgentMixin, AgentBase)``, making AgentBase one of the
+direct base classes.
 
-详细 API 见 docs/new_design.md 第 8 节。
+See docs/new_design.md section 8 for the detailed API.
 """
 
 from __future__ import annotations
@@ -35,13 +39,17 @@ _log = logging.getLogger(__name__)
 
 
 class _PlatformLogHandler(logging.Handler):
-    """把 Python 标准 logging 记录转发到 Booster 平台 logger(``self.logger``)。
+    """Forward standard Python logging records to the Booster platform logger (``self.logger``).
 
-    平台 logger 是 rclcpp 风格,只有 ``.info/.warn/.error(msg: str)``。标准
-    logging 默认无 handler、INFO 被丢弃,所以框架和用户代码的日志都看不到;装上
-    这个桥后,``logging.getLogger(__name__).info(...)`` 会正确路由到控制台/日志文件。
+    The platform logger is rclcpp-style, offering only
+    ``.info/.warn/.error(msg: str)``. Standard logging has no handler by
+    default and INFO is dropped, so neither framework nor user code logs
+    would be visible; once this bridge is installed,
+    ``logging.getLogger(__name__).info(...)`` is correctly routed to the
+    console/log file.
 
-    平台耦合只集中在这里;runtime / player 等仍用平台无关的标准 logging。
+    Platform coupling is concentrated here only; runtime / player etc.
+    still use platform-agnostic standard logging.
     """
 
     def __init__(self, platform_logger: object) -> None:
@@ -65,9 +73,9 @@ class _PlatformLogHandler(logging.Handler):
 
 
 class SoccerAgentMixin:
-    """框架行为 mixin;不继承 AgentBase,须与 AgentBase 组合。
+    """Framework behavior mixin; does not inherit from AgentBase, must be combined with AgentBase.
 
-    用法::
+    Usage::
 
         from booster_agent_framework import AgentBase
         from .soccer.agent import SoccerAgentMixin
@@ -80,46 +88,49 @@ class SoccerAgentMixin:
 
             def init_store(self, store): ...
 
-    MRO 为 ``[MyAgent, SoccerAgentMixin, AgentBase, object]``,``super().__init__``
-    会正确走到 ``AgentBase.__init__``。
+    The MRO is ``[MyAgent, SoccerAgentMixin, AgentBase, object]``, so
+    ``super().__init__`` correctly reaches ``AgentBase.__init__``.
     """
 
     # ------------------------------------------------------------------
-    # 用户填的槽
+    # Slots filled in by the user
     # ------------------------------------------------------------------
 
-    # 槽 1:Player 类。main.py 必须设置 ``player_class = Player``(从 src.player 导入)。
-    #       框架不 import 用户的 player.py,依赖注入保持依赖向下。
+    # Slot 1: the Player class. main.py must set ``player_class = Player``
+    #         (imported from src.player). The framework does not import the
+    #         user's player.py -- dependency injection keeps the dependency
+    #         pointing downward.
     player_class: "type[Player]"
 
-    # 槽 2:play —— 每帧调用(默认 no-op)
+    # Slot 2: play -- called every frame (no-op by default)
     @staticmethod
     def play(
         context: "Context",
         players: "list[Player]",
         store: "SimpleNamespace",
     ) -> None:
-        """30Hz 调用。默认啥都不做;子类按需 override。"""
+        """Called at 30Hz. Does nothing by default; subclasses override as needed."""
 
-    # 槽 3:init_store —— 开赛前调一次(可选)
+    # Slot 3: init_store -- called once before the match starts (optional)
     def init_store(self, store: "SimpleNamespace") -> None:
-        """默认 no-op;子类按需 override。"""
+        """No-op by default; subclasses override as needed."""
 
     # ------------------------------------------------------------------
-    # 框架内部 —— 用户通常不改
+    # Framework internals -- users normally don't touch these
     # ------------------------------------------------------------------
 
     def __init__(self) -> None:
-        # 走 MRO 到 AgentBase.__init__(AgentFeatures())
+        # Follow the MRO to AgentBase.__init__(AgentFeatures())
         super().__init__(AgentFeatures())  # type: ignore[call-arg]
         self._setup_logging()
         self.config = SoccerConfig.from_env()
-        # ROS 数据源(Docker-only);延迟 import,避免开发机无 rclpy 时污染
+        # ROS data source (Docker-only); deferred import to avoid polluting
+        # dev machines without rclpy
         from .ros_source import RosContextSource
 
         source = RosContextSource(self.config)
         self.runtime = SoccerRuntime(self, context_source=source)
-        # 为每个 player 创建 backend(SDK 包装)并注入
+        # Create a backend (SDK wrapper) for each player and inject it
         self._create_backends()
         _log.info(
             "SoccerAgent initialized: team_id=%d robots=%s",
@@ -127,7 +138,7 @@ class SoccerAgentMixin:
         )
 
     def _create_backends(self) -> None:
-        """为每个 player 创建 SDK backend。Docker-only,延迟 import。"""
+        """Create an SDK backend for each player. Docker-only, deferred import."""
         from .robot_backend import RobotBackend
 
         for player in self.runtime._players:
@@ -135,15 +146,17 @@ class SoccerAgentMixin:
             player._backend = RobotBackend(player.id, robot_name)
 
     def _setup_logging(self) -> None:
-        """把标准 logging 桥接到平台 logger,让框架和用户日志可见。
+        """Bridge standard logging to the platform logger so framework and user logs are visible.
 
-        ``self.logger`` 由 AgentBase 在 ``super().__init__`` 后提供。桥只装一次;
-        重复激活时先清掉旧桥避免重复输出。
+        ``self.logger`` is provided by AgentBase after ``super().__init__``.
+        The bridge is only installed once; on repeated activation, the old
+        bridge is removed first to avoid duplicate output.
         """
 
         platform_logger = getattr(self, "logger", None)
         if platform_logger is None:
-            # 没有平台 logger(理论上不该发生):退回 stderr,std 流已被框架重定向。
+            # No platform logger (shouldn't happen in theory): fall back to
+            # stderr, since the framework has already redirected the std streams.
             logging.basicConfig(level=logging.INFO)
             return
         root = logging.getLogger()

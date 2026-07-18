@@ -1,9 +1,12 @@
-"""几何 helper —— 纯函数,无状态,吃 Context / 坐标。
+"""Geometry helpers — pure functions, stateless, take Context / coordinates.
 
-【utils】框架预置的工具样例,用户可读可改可 fork,也可在本目录加自己的 util
-(如"球是否出界")。放这里是因为这些计算换打法不变,且被 nav / 策略复用。
+【utils】Sample tools shipped with the framework; users can read, modify, or
+fork them, and can add their own utils in this directory (e.g. "is the ball
+out of bounds"). They live here because these calculations don't change with
+playbook changes, and are reused by nav / strategy.
 
-坐标系:队伍场地视角,+x 朝对方球门,-x 朝己方球门,场地中心 (0,0)。
+Coordinate system: team's field-relative view, +x toward the opponent's
+goal, -x toward our own goal, field center at (0,0).
 """
 
 from __future__ import annotations
@@ -23,12 +26,12 @@ def normalize_angle(a: float) -> float:
 
 
 def deg2rad(deg: float) -> float:
-    """角度制转弧度制。"""
+    """Degrees to radians."""
     return math.radians(deg)
 
 
 def rad2deg(rad: float) -> float:
-    """弧度制转角度制。"""
+    """Radians to degrees."""
     return math.degrees(rad)
 
 
@@ -37,24 +40,28 @@ def dist(ax: float, ay: float, bx: float, by: float) -> float:
 
 
 def angle_to(fx: float, fy: float, tx: float, ty: float) -> float:
-    """从 (fx,fy) 指向 (tx,ty) 的场地角度。"""
+    """Field angle pointing from (fx,fy) toward (tx,ty)."""
     return math.atan2(ty - fy, tx - fx)
 
 
 def opponent_goal(ctx: Context) -> tuple[float, float]:
-    """对方球门中心(进攻目标),取门线后方一点避免球压线时反向瞄准。"""
+    """Center of the opponent's goal (attacking target); offset slightly
+    behind the goal line to avoid aiming backward when the ball is right on
+    the line."""
     return (ctx.field.length / 2.0 + GOAL_TARGET_DEPTH_M, 0.0)
 
 
 def own_goal(ctx: Context) -> tuple[float, float]:
-    """己方球门中心(防守核心)。"""
+    """Center of our own goal (defensive anchor point)."""
     return (-ctx.field.length / 2.0, 0.0)
 
 
 def own_goal_area_center(ctx: Context) -> tuple[float, float]:
-    """己方小禁区(球门区)中心 —— 守门员无威胁时的默认站位。
+    """Center of our own goal area (small box) — the default stance point
+    when the goalkeeper faces no threat.
 
-    小禁区从己方门线沿 +x 伸进 ``goal_area_length``,中心在门线内侧半个进深处。
+    The goal area extends from our goal line along +x by ``goal_area_length``;
+    its center is half that depth inside the goal line.
     """
     return (-ctx.field.length / 2.0 + ctx.field.goal_area_length / 2.0, 0.0)
 
@@ -62,7 +69,43 @@ def own_goal_area_center(ctx: Context) -> tuple[float, float]:
 def clamp_inside_field(
     ctx: Context, x: float, y: float, margin: float = 2.0,
 ) -> tuple[float, float]:
-    """把 (x,y) 夹进场地矩形内(留 margin 余量)。"""
+    """Clamp (x,y) inside the field rectangle (leaving a margin)."""
     half_l = ctx.field.length / 2.0 - margin
     half_w = ctx.field.width / 2.0 - margin
     return (clamp(x, -half_l, half_l), clamp(y, -half_w, half_w))
+
+
+def defensive_screen_spot(
+    ctx: Context,
+    ball_x: float,
+    ball_y: float,
+    index: int = 0,
+    count: int = 1,
+    clear: float = 2.0,
+    spread: float = 0.8,
+) -> tuple[float, float]:
+    """A legal defensive spot for defending an opponent's set play.
+
+    Returns a point on the [ball -> own-goal-center] line, at least ``clear``
+    meters from the ball (so we don't breach the required set-play distance
+    and get sent off), spread laterally by ``index``/``count`` so multiple
+    defenders don't stack, and clamped inside the field. Screens the lane to
+    our goal while staying legal. The lateral spread is perpendicular to the
+    ball->goal line, which only *increases* distance from the ball, so the
+    clearance floor is preserved (except where field-boundary clamping pulls a
+    spot back in — near a corner the effective clearance can shrink slightly).
+    """
+    gx, gy = own_goal(ctx)
+    dx, dy = gx - ball_x, gy - ball_y
+    d = math.hypot(dx, dy)
+    ux, uy = (dx / d, dy / d) if d > 1e-6 else (-1.0, 0.0)
+    tx = ball_x + ux * clear
+    ty = ball_y + uy * clear
+    if count > 1:
+        px, py = -uy, ux                       # perpendicular to the ball->goal line
+        offset = (index - (count - 1) / 2.0) * spread
+        tx += px * offset
+        ty += py * offset
+    half_l = ctx.field.length / 2.0
+    half_w = ctx.field.width / 2.0 - 0.3
+    return (clamp(tx, -half_l + 0.3, half_l - 0.3), clamp(ty, -half_w, half_w))

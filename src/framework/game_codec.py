@@ -1,9 +1,11 @@
-"""GameController 状态 JSON 解码。
+"""GameController state JSON decoding.
 
-把裁判机 topic 的 JSON 转成 :class:`GameControlState`。纯字段映射 + 健壮解析,
-无 ROS / SDK 依赖,可在开发机独立单测。
+Converts the JSON from the game controller topic into
+:class:`GameControlState`. Pure field mapping + robust parsing, no ROS /
+SDK dependency, can be unit-tested independently on a dev machine.
 
-只保留解码方向(读取用);编码在新框架里用不到,故不移植。
+Only the decode direction (for reading) is kept; encoding is not used in
+the new framework, so it was not ported over.
 """
 
 from __future__ import annotations

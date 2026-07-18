@@ -1,11 +1,15 @@
-"""避障:障碍收集 + 单障碍绕行 via 点 —— 纯函数,可单测。
+"""Obstacle avoidance: obstacle collection + single-obstacle via-point
+detouring — pure functions, unit-testable.
 
-【utils】移植自旧 MotionController 的路径绕行层:从起点到目标画一条走廊,找第一个
-挡路的圆形障碍,在其侧面生成一个 via 点绕过去。绕哪侧由调用方跨帧记忆(walk_to
-用 self._avoid_side)。
+【utils】Ported from the old MotionController's path-detour layer: draw a
+corridor from start to target, find the first circular obstacle blocking it,
+and generate a via point to its side to go around it. Which side to go
+around is remembered cross-frame by the caller (walk_to uses
+self._avoid_side).
 
-障碍是可选的:球在对方重开时才算障碍(见 collect_obstacles 的 ball/robots 开关)。
-半径等常数在此,可调。
+Obstacles are optional: the ball only counts as an obstacle during the
+opponent's restart (see the ball/robots switches on collect_obstacles).
+Radii and other constants live here and are tunable.
 """
 
 from __future__ import annotations
@@ -46,7 +50,8 @@ def collect_obstacles(
     robots: bool,
     goals: bool = False,
 ) -> list[Obstacle]:
-    """按开关收集圆形障碍。ball=球,robots=对手+队友(排除自己),goals=两侧球门结构。"""
+    """Collect circular obstacles based on the given switches. ball=the ball,
+    robots=opponents+teammates (excluding self), goals=both goal structures."""
     obstacles: list[Obstacle] = []
     if ball and context.ball is not None:
         obstacles.append(
@@ -65,7 +70,8 @@ def collect_obstacles(
 
 
 def goal_obstacles(context: Context) -> list[Obstacle]:
-    """两侧球门做成不可穿越的 U 形结构:4 根柱 + 3 面网采样成圆。"""
+    """Model both goals as impassable U-shaped structures: 4 posts + 3 net
+    faces sampled into circles."""
     f = context.field
     half_l = f.length / 2.0
     half_gw = f.goal_width / 2.0
@@ -73,14 +79,14 @@ def goal_obstacles(context: Context) -> list[Obstacle]:
     for sign_x in (-1.0, 1.0):
         front_x = sign_x * half_l
         back_x = sign_x * (half_l + GOAL_DEPTH)
-        for sign_y in (-1.0, 1.0):                       # 四根柱(前后各两根)
+        for sign_y in (-1.0, 1.0):                       # Four posts (two front, two back)
             obstacles.append(Obstacle(front_x, sign_y * half_gw, POST_RADIUS))
             obstacles.append(Obstacle(back_x, sign_y * half_gw, POST_RADIUS))
-        # 后网
+        # Back net
         obstacles += _sample_segment(
             back_x, -half_gw, back_x, half_gw, NET_STEP, NET_RADIUS,
         )
-        # 两侧网
+        # Side nets
         for sign_y in (-1.0, 1.0):
             obstacles += _sample_segment(
                 front_x, sign_y * half_gw, back_x, sign_y * half_gw,
@@ -92,7 +98,8 @@ def goal_obstacles(context: Context) -> list[Obstacle]:
 def _sample_segment(
     x0: float, y0: float, x1: float, y1: float, step: float, radius: float,
 ) -> list[Obstacle]:
-    """沿线段均匀采样圆形障碍(不含端点,端点由柱覆盖)。"""
+    """Uniformly sample circular obstacles along a segment (excluding
+    endpoints, which are covered by the posts)."""
     length = math.hypot(x1 - x0, y1 - y0)
     if length <= step:
         return []
@@ -112,10 +119,12 @@ def detour(
     obstacles: list[Obstacle],
     side_hint: float | None,
 ) -> tuple[tuple[float, float], float | None]:
-    """在 (sx,sy)→(tx,ty) 路径上绕开第一个挡路障碍。
+    """Detour around the first blocking obstacle on the (sx,sy)->(tx,ty) path.
 
-    返回 (可能被替换成 via 点的目标, 本次用的绕行侧)。无障碍时返回原目标和 None
-    (调用方据此清空侧记忆)。``side_hint`` 是上帧记住的侧别,保持避免横跳。
+    Returns (target, possibly replaced with a via point; the detour side used
+    this time). When there's no obstacle, returns the original target and
+    None (the caller clears its side memory based on this). ``side_hint`` is
+    the side remembered from the previous frame, to avoid flip-flopping.
     """
     blocker = _first_blocking_obstacle(sx, sy, tx, ty, obstacles)
     if blocker is None:
@@ -128,7 +137,7 @@ def detour(
 def _first_blocking_obstacle(
     sx: float, sy: float, tx: float, ty: float, obstacles: list[Obstacle],
 ) -> Obstacle | None:
-    """找真正挡在走廊里、离起点最近的障碍。"""
+    """Find the obstacle that actually blocks the corridor and is closest to the start."""
     seg_dx, seg_dy = tx - sx, ty - sy
     seg_len = math.hypot(seg_dx, seg_dy)
     if seg_len < 1e-6:
@@ -153,7 +162,8 @@ def _first_blocking_obstacle(
 def _choose_side(
     sx: float, sy: float, tx: float, ty: float, obstacle: Obstacle,
 ) -> float:
-    """障碍在路径左侧则从右绕(-1),反之从左绕(+1),取较短绕行。"""
+    """If the obstacle is left of the path, go around on the right (-1);
+    otherwise go left (+1) — whichever is the shorter detour."""
     seg_dx, seg_dy = tx - sx, ty - sy
     seg_len = math.hypot(seg_dx, seg_dy)
     if seg_len < 1e-6:
@@ -167,7 +177,8 @@ def _via_point(
     sx: float, sy: float, tx: float, ty: float,
     obstacle: Obstacle, side_sign: float,
 ) -> tuple[float, float]:
-    """在障碍侧面生成 via 点:投影到路径的最近点,再沿法向偏移 (半径+余量)。"""
+    """Generate a via point to the side of the obstacle: project onto the
+    closest point on the path, then offset along the normal by (radius + margin)."""
     seg_dx, seg_dy = tx - sx, ty - sy
     seg_len = math.hypot(seg_dx, seg_dy)
     if seg_len < 1e-6:

@@ -1,15 +1,18 @@
-"""Player:单个机器人的控制 handle —— 用户可直接编辑这个类。
+"""Player: the control handle for a single robot — users can edit this class directly.
 
-平台原语(set_velocity / kick / release_kick / request_mode / get_up)委托给注入的
-``_backend``(framework 层);状态 property(pose / mode / is_fallen / penalty)从
-``self.context`` 或 backend 读。
+Platform primitives (set_velocity / kick / release_kick / request_mode /
+get_up) are delegated to the injected ``_backend`` (framework layer); state
+properties (pose / mode / is_fallen / penalty) are read from ``self.context``
+or the backend.
 
-走位行为(walk_to / face_to / ensure_ready)也是 Player 方法:它们本质是"对本
-球员下命令的动词",且未来加迟滞/避障需要的跨帧状态可直接挂 ``self``。纯坐标计算
-(dist / angle_to / 球门坐标等)才放 utils/geom。
+Movement behaviors (walk_to / face_to / ensure_ready) are also Player
+methods: they're fundamentally "verbs issued to this player," and any
+cross-frame state needed for future hysteresis/avoidance can hang directly
+off ``self``. Pure coordinate math (dist / angle_to / goal coordinates etc.)
+belongs in utils/geom instead.
 
-实例跨整场比赛存活;``self.context`` 每帧被框架覆写。用户想加自己的拐棍方法直接
-在这里加。
+Instances live for the whole match; ``self.context`` is overwritten by the
+framework every frame. To add your own custom moves, add them directly here.
 """
 
 from __future__ import annotations
@@ -19,7 +22,6 @@ import math
 from typing import TYPE_CHECKING
 
 from .framework.types import Context, Penalty, Pose2D
-from .framework import debugdraw
 
 from .param import *
 from .utils.geom import (
@@ -29,13 +31,15 @@ from .utils.geom import (
     normalize_angle,
     opponent_goal,
     own_goal,
-    own_goal_area_center,
 )
 from .utils.obstacles import collect_obstacles
 from .utils.path_planner import plan_global_path
+from .utils.tactics import attacking_outlet_spot
+from .utils.worldmodel import goal_line_crossing
 
 if TYPE_CHECKING:
     from .framework.config import SoccerConfig
+    from .utils.worldmodel import BallEstimate
 
 
 __all__ = ["Player"]
@@ -46,18 +50,22 @@ _log = logging.getLogger(__name__)
 def _heading_clearance(
     px: float, py: float, heading: float, obstacles: list,
 ) -> float:
-    """用于局部避障。沿 (px,py) 朝 ``heading`` 的 lookahead 射线,到最近障碍的余量(dist - radius)。
+    """Used for local obstacle avoidance. Along the lookahead ray from (px,py)
+    toward ``heading``, the clearance (dist - radius) to the nearest obstacle.
 
-    只考虑**前方**(投影 t>0)的障碍;身后 / 侧后的障碍不挡这个方向,跳过——否则贴近
-    任何障碍(哪怕正后方)都会把所有方向的余量拉低,误判"全堵"。
-    无障碍返回 inf;越大越空,负值表示会撞。
+    Only considers obstacles **ahead** (projection t>0); obstacles behind/to
+    the side don't block this direction and are skipped — otherwise being
+    close to any obstacle (even directly behind) would drag down the
+    clearance for every direction and falsely signal "fully blocked."
+    Returns inf when there's no obstacle; larger = more open, negative means
+    a collision.
     """
     ux, uy = math.cos(heading), math.sin(heading)
     min_clear = math.inf
     for obs in obstacles:
         t = (obs.x - px) * ux + (obs.y - py) * uy
         if t <= 0.0:
-            continue                      # 障碍在身后/侧后,不挡此方向
+            continue                      # Obstacle is behind/to the side, doesn't block this direction
         if t > PLAN_LOOKAHEAD:
             t = PLAN_LOOKAHEAD
         nx, ny = px + ux * t, py + uy * t
@@ -70,21 +78,25 @@ def _heading_clearance(
 def _behind_ball(
     ball_x: float, ball_y: float, aim: tuple[float, float], offset: float,
 ) -> tuple[float, float]:
-    """用于计算站位。球在 球→``aim`` 连线上的"后方"点:从球沿【背离 aim】方向退 ``offset`` 米。
+    """Used for computing a positioning target. The point "behind" the ball on
+    the ball->``aim`` line: retreat ``offset`` meters from the ball, away from aim.
 
-    追球走位目标用它:球落在机器人与 ``aim`` 之间,到位时天然对准 aim 方向。
-    aim 与球重合(退化)时,方向不定,直接返回球位。
+    Used as the chase target while pursuing the ball: the ball ends up
+    between the robot and ``aim``, so on arrival the robot is naturally
+    lined up to shoot toward aim. When aim coincides with the ball
+    (degenerate case), direction is undefined, so just return the ball's
+    position.
     """
     dx, dy = aim[0] - ball_x, aim[1] - ball_y
     d = math.hypot(dx, dy)
     if d < 1e-6:
         return (ball_x, ball_y)
-    ux, uy = dx / d, dy / d              # 球指向 aim 的单位向量
-    return (ball_x - ux * offset, ball_y - uy * offset)   # 背离 aim 退 offset
+    ux, uy = dx / d, dy / d              # Unit vector from ball toward aim
+    return (ball_x - ux * offset, ball_y - uy * offset)   # Retreat offset, away from aim
 
 
 class Player:
-    """单个球员的 handle。可以在这里加入新的技术动作。
+    """Handle for a single player. Add new technical moves here.
     """
 
     def __init__(
@@ -95,40 +107,42 @@ class Player:
     ) -> None:
         self.id: int = player_id
         self.config: "SoccerConfig" = config
-        self._backend = _backend           # 机器人控制接口的包装，通常不用改
+        self._backend = _backend           # Wrapper around the robot control interface, usually no need to change
         self.context: Context | None = None
 
-        # 当前高层动作名(仅供可视化/调试)。策略分派层每帧写入;有子状态的动作
-        # (如 guard)在方法内部细化。可视化 pass 读它标注文字,见 main.py。
+        # Current high-level action name (for visualization/debugging only).
+        # Written every frame by the strategy dispatch layer; actions with
+        # sub-states (like guard) refine it internally. The visualization
+        # pass reads this to label markers, see main.py.
         self.action: str = "init"
 
-        # SDK 缓存字段,框架后台会自动更新
+        # SDK-cached fields, updated automatically by the framework in the background
         self._mode: str | None = None
         self._fall_down_state: str | None = None
 
-        # 避障绕行侧记忆(跨帧;None=当前无绕行)
+        # Avoidance detour-side memory (cross-frame; None = not currently detouring)
         self._avoid_side: float | None = None
 
-        # 踢球迟滞状态(跨帧)
+        # Kick hysteresis state (cross-frame)
         self._kicking: bool = False
 
-        # block/guard 的跨帧迟滞状态
+        # block/guard cross-frame hysteresis state
         self._block_pressing: bool = False
         self._guard_threatened: bool = False
-        # 门线撞球进门迟滞状态
+        # Goal-line ball-push hysteresis state
         self._goal_line_push: bool = False
-        # support 卡住后临时转 attack 的跨帧状态
+        # Cross-frame state for support temporarily switching to attack when stuck
         self._support_last_pos: tuple[float, float] | None = None
         self._support_stationary_since: float | None = None
         self._support_last_update_at: float | None = None
 
     # ------------------------------------------------------------------
-    # 状态读取
+    # State readers
     # ------------------------------------------------------------------
 
     @property
     def is_kicking(self) -> bool:
-        """当前是否处于踢球状态。"""
+        """Whether currently in the kicking state."""
         return self._kicking
 
     @property
@@ -168,7 +182,7 @@ class Player:
         return self.penalty != Penalty.NONE
 
     # ------------------------------------------------------------------
-    # 底盘控制
+    # Chassis control
     # ------------------------------------------------------------------
 
     def set_velocity(self, vx: float, vy: float, vyaw: float) -> None:
@@ -185,7 +199,7 @@ class Player:
         self.set_velocity(0.0, 0.0, 0.0)
 
     # ------------------------------------------------------------------
-    # 踢球
+    # Kicking
     # ------------------------------------------------------------------
 
     def kick(
@@ -216,7 +230,7 @@ class Player:
                 self.id, ball.x, ball.y, kick_direction,
             )
             return
-        # 场地坐标 → 体坐标(用当前 pose)
+        # Field coordinates -> body coordinates (using current pose)
         dx = ball.x - pose.x
         dy = ball.y - pose.y
         cos_t = math.cos(pose.theta)
@@ -230,10 +244,11 @@ class Player:
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
     def plan_kick(self) -> tuple[float, float] | None:
-        """计算踢球方向和力度。
+        """Compute kick direction and power.
 
-        从当前球位踢向对方球门中心,力度 2.0。
-        返回 ``(kick_direction, kick_power)``;球或上下文不可用时返回 None。
+        Kicks from the current ball position toward the center of the
+        opponent's goal, power 2.0. Returns ``(kick_direction, kick_power)``;
+        returns None when the ball or context is unavailable.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
@@ -254,7 +269,8 @@ class Player:
     def _goal_target_for_direction(
         self, kick_direction: float,
     ) -> tuple[float, float]:
-        """把射门方向投到对方门线上,用于可视化踢球目标。"""
+        """Project the shot direction onto the opponent's goal line, for
+        visualizing the kick target."""
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
@@ -268,7 +284,7 @@ class Player:
         return (goal_x, ball.y + math.sin(kick_direction) * t)
 
     def _in_backfield(self) -> bool:
-        """球在我方后场时,默认踢球加大力度。"""
+        """Kick harder by default when the ball is in our own half."""
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
@@ -278,7 +294,7 @@ class Player:
         return ball.x < 0
 
     def _draw_kick_target(self, target: tuple[float, float]) -> None:
-        """以 X 标出 plan_kick 选择的踢球目标。"""
+        """Mark the kick target chosen by plan_kick with an X."""
         from .framework import debugdraw
 
         x, y = target
@@ -293,14 +309,15 @@ class Player:
         )
 
     def release_kick(self) -> None:
-        self._kicking = False  # 清除踢球迟滞标志(取消方块显示)
+        self._kicking = False  # Clear the kick hysteresis flag (cancels the cube display)
         if self._backend is None:
             _log.debug("player %d release_kick (no backend)", self.id)
             return
         self._backend.release_kick()
 
     def kick_can_score(self, kick_direction: float) -> bool:
-        """判断从当前球位按 ``kick_direction`` 踢,直线轨迹是否能进对方球门。
+        """Determine whether kicking from the current ball position along
+        ``kick_direction`` would score on a straight trajectory.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
@@ -326,7 +343,7 @@ class Player:
         return -half_goal <= y_at_goal <= half_goal
 
     # ------------------------------------------------------------------
-    # 慢操作（同步接口异步调取，使得不阻塞）
+    # Slow operations (sync interface invoked asynchronously, so we don't block)
     # ------------------------------------------------------------------
 
     def request_mode(self, mode: str) -> None:
@@ -342,13 +359,14 @@ class Player:
         self._backend.get_up()
 
     # ------------------------------------------------------------------
-    # 走位
+    # Movement
     # ------------------------------------------------------------------
 
     def ensure_ready(self) -> bool:
-        """活性自理:摔倒→起身,非 walk→切模式(都异步、不产生移动)。
+        """Self-recovery: fallen -> get up, not in walk mode -> switch modes
+        (both async, produce no movement).
 
-        返回本帧是否可执行动作(True=已就绪)。
+        Returns whether an action can be executed this frame (True = ready).
         """
         if self.is_fallen:
             self.get_up()
@@ -359,7 +377,7 @@ class Player:
         return True
 
     def face_to(self, target_theta: float) -> None:
-        """原地转向到目标朝向。"""
+        """Turn in place to face the target heading."""
         if self.pose is None:
             self.stop()
             return
@@ -375,16 +393,22 @@ class Player:
         avoid_robots: bool = False,
         arrive_dist: float = ARRIVE_DIST,
     ) -> bool:
-        """走向目标点。返回是否已到达。
+        """Walk toward the target point. Returns whether it has arrived.
 
-        避障(局部规划器,简化版 VFH):``avoid_ball`` / ``avoid_robots`` 开启时,把
-        球 / 机器人 / 球门结构收集成圆形障碍,在机器人周围扫一圈候选方向,选"最朝
-        目标 + 前方 ``PLAN_LOOKAHEAD`` 内不撞障碍"的方向前进。能处理多障碍、凹形
-        结构和对称冲突,比单障碍绕行 / 势场排斥稳。
+        Obstacle avoidance (local planner, simplified VFH): when
+        ``avoid_ball`` / ``avoid_robots`` are enabled, the ball / robots /
+        goal structures are collected into circular obstacles, and a sweep of
+        candidate directions around the robot picks the one that's "most
+        toward the target + clear of obstacles within ``PLAN_LOOKAHEAD``
+        ahead." This handles multiple obstacles, concave structures, and
+        symmetric conflicts more robustly than single-obstacle detours or
+        potential-field repulsion.
 
-        行走两种模式:近距离全向,远距离转身-走。``face`` 指定到达/近距离时的朝向。
+        Two walking modes: omnidirectional at close range, turn-then-walk at
+        long range. ``face`` specifies the heading to hold on arrival/at
+        close range.
         """
-        self.release_kick() # 踢球状态下，走位会被覆盖，先取消踢球状态
+        self.release_kick() # Movement overrides kicking, so cancel kick state first
         pose = self.pose
         if pose is None:
             self.stop()
@@ -396,7 +420,7 @@ class Player:
         distance = math.hypot(dx, dy)
 
         if distance < arrive_dist:
-            # 已到达:按需转到目标朝向
+            # Arrived: turn to face the target heading if requested
             if face is not None:
                 err = normalize_angle(face - pose.theta)
                 if abs(err) > 0.1:
@@ -407,7 +431,8 @@ class Player:
                 self.stop()
             return True
 
-        # 规划:默认全局 A*,找不到路时退回旧局部规划。
+        # Planning: defaults to global A*, falls back to the old local planner
+        # when no path is found.
         goal_dir = math.atan2(dy, dx)
         planned_path: list[tuple[float, float]] | None = None
         waypoint: tuple[float, float] | None = None
@@ -434,8 +459,9 @@ class Player:
         else:
             heading = goal_dir
 
-        # 可视化:目标点(绿)、到目标连线(灰)、规划朝向(黄箭头)、
-        # 前方探测射线(青,长度=lookahead;规划器"看"的范围,无 path/途径点概念)
+        # Visualization: target point (green), line to target (gray), planned
+        # heading (yellow arrow), forward probe ray (cyan, length=lookahead;
+        # the range the planner "looks" ahead, no path/waypoint concept here)
         from .framework import debugdraw
         debugdraw.point(tx, ty, rgb=(0.0, 1.0, 0.0), scale=0.15, ns="target")
         debugdraw.line([(pose.x, pose.y), (tx, ty)], rgb=(0.4, 0.4, 0.4), ns="to_target")
@@ -459,7 +485,8 @@ class Player:
         )
 
         if distance <= OMNI_DIST:
-            # 近距离:全向行走,沿 heading 平移,同时转向 face
+            # Close range: omnidirectional walking, translate along heading
+            # while turning toward face
             wdx, wdy = math.cos(heading) * distance, math.sin(heading) * distance
             cos_t, sin_t = math.cos(pose.theta), math.sin(pose.theta)
             vx = LINEAR_GAIN * (wdx * cos_t + wdy * sin_t)
@@ -474,7 +501,7 @@ class Player:
             )
             self.set_velocity(vx, vy, vyaw)
         else:
-            # 远距离:转身-走-转身,朝 heading
+            # Long range: turn-walk-turn, facing heading
             angle_err = normalize_angle(heading - pose.theta)
             if abs(angle_err) > TURN_THRESHOLD:
                 self.set_velocity(0.0, 0.0, self._angular(angle_err))
@@ -507,10 +534,14 @@ class Player:
     def _plan_heading(
         self, pose: Pose2D, goal_dir: float, obstacles: list,
     ) -> float:
-        """扫候选方向,选最朝目标且前方够空的方向;都不够空时返回最空的那个。
+        """Sweep candidate directions, pick the one most toward the target
+        that's clear enough ahead; if none is clear enough, return the most
+        open one.
 
-        候选按偏离目标方向 ``|offset|`` 从小到大试;先试哪一侧由 player_id 奇偶决定,
-        用来打破两人同侧避让的对称。
+        Candidates are tried in order of increasing deviation ``|offset|``
+        from the target direction; which side is tried first is decided by
+        player_id parity, to break the symmetry when two players avoid on
+        the same side.
         """
         sign_first = 1.0 if self.id % 2 == 0 else -1.0
         best_h = goal_dir
@@ -533,14 +564,15 @@ class Player:
         return best_h
 
     # ------------------------------------------------------------------
-    # 高层动作(策略在 main.py 里直接调这些)
+    # High-level actions (strategy in main.py calls these directly)
     # ------------------------------------------------------------------
 
 
     def block_path_projection(
         self, opponent_id: int,
     ) -> tuple[float, float, float, float] | None:
-        """自己到 对手→球 线段的垂足:返回 (x, y, 垂距, 线段参数 t)。"""
+        """The foot of the perpendicular from self onto the opponent->ball
+        segment: returns (x, y, perpendicular distance, segment parameter t)."""
         ctx = self.context
         pose = self.pose
         ball = ctx.ball if ctx is not None else None
@@ -564,11 +596,15 @@ class Player:
         return tx, ty, dist(pose.x, pose.y, tx, ty), raw_t
 
     def attack(self, kick_target: tuple[float, float] | None = None) -> None:
-        """追球射门。踢向 ``kick_target``(默认对方球门中心)。
+        """Chase the ball and shoot. Kicks toward ``kick_target`` (defaults to
+        the opponent's goal center).
 
-        踢球迟滞:距球 ≤ ENTER 进入踢球;进入后距球 > EXIT 才退出(EXIT > ENTER),
-        防边界抖动。不避障——正常拼抢要直取球。追球目标设在【球后方】(球→球门连线
-        上、背离球门退 ``CHASE_BEHIND_M``),到位时天然对准射门方向。
+        Kick hysteresis: enters kicking state when within ENTER of the ball;
+        once in, only exits when farther than EXIT (EXIT > ENTER), to prevent
+        boundary jitter. No obstacle avoidance — normal play should go
+        straight for the ball. The chase target is set **behind the ball**
+        (on the ball->goal line, retreating ``CHASE_BEHIND_M`` away from the
+        goal), so arrival naturally lines up the shot direction.
         """
         ball = self.context.ball if self.context is not None else None
         if ball is None or self.pose is None:
@@ -592,36 +628,151 @@ class Player:
                 _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
             )
 
-    def guard(self) -> None:
-        """守门:站小禁区中央待命
+    def guard(self, ball_est: "BallEstimate | None" = None) -> None:
+        """Goalkeeper: arc positioning + angle-closing step-out + velocity-based saves.
 
-        无 pose(未就位)时退回站小禁区中央。
+        Two modes (with hysteresis, to avoid frame-to-frame jitter):
+        - **arc (default)**: stands on the [ball -> own-goal-center] line, at
+          a step-out distance from goal center. The closer/more central the
+          ball, the farther the step-out (closing the angle); the farther the
+          ball, the closer it hugs the goal line. Lateral y is clamped near
+          the goal mouth.
+        - **save**: when the ball is moving fast toward goal and the
+          predicted landing point is near the goal mouth, drops back to a
+          shallow stance line and slides laterally to block the predicted
+          landing point. Requires ``ball_est`` (velocity estimate); falls
+          back to arc mode without one.
+
+        Always faces the ball (``GUARD_FACE_BALL``) for fast reaction; never
+        avoids the ball (avoiding it would mean dodging incoming shots).
         """
-        home = own_goal_area_center(self.context) if self.context is not None else None
-        if home is None or self.pose is None:
-            self.action = "guard:stop"
+        ctx = self.context
+        if ctx is None or self.pose is None:
+            self.action = "keeper:stop"
             self.stop()
             return
 
-        ball = self.context.ball if self.context is not None else None
+        gx, gy = own_goal(ctx)                       # Own goal center (-half_l, 0)
+        half_goal = ctx.field.goal_width / 2.0
+        ball = ctx.ball
 
-        # 待命朝向:朝球(便于快速反应);球不可见则朝对方门方向(默认 0)。
+        # Facing: toward the ball (ball not visible -> toward the opponent's goal direction, default 0).
         face = 0.0
         if GUARD_FACE_BALL and ball is not None:
-            face = angle_to(
-                self.pose.x, self.pose.y, ball.x, ball.y,
-            )
+            face = angle_to(self.pose.x, self.pose.y, ball.x, ball.y)
 
-        self.action = "guard:home"
-        debugdraw.point(
-            home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
+        # Save trigger (with hysteresis, writes self._guard_threatened).
+        save_x = gx + KEEPER_SAVE_LINE_M
+        crossing = (
+            goal_line_crossing(ball_est, save_x) if ball_est is not None else None
         )
-        self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
+        save_active = self._update_keeper_threat(crossing, ball_est, half_goal)
+
+        if save_active and crossing is not None:
+            # Save: drop back to the shallow line, slide laterally to the
+            # predicted landing point (clamped inside the goal mouth), skip
+            # avoidance for speed.
+            y_cross, _t = crossing
+            limit = half_goal + 0.1
+            tx, ty = save_x, clamp(y_cross, -limit, limit)
+            self.action = "keeper:save"
+            self._draw_keeper(ctx, tx, ty, crossing, save=True)
+            self.walk_to((tx, ty), face=face, avoid_ball=False, avoid_robots=False)
+            return
+
+        # arc: stand on the [ball -> goal center] line, stepping out per step_out to close the angle.
+        bx, by = (ball.x, ball.y) if ball is not None else (0.0, 0.0)
+        dx, dy = bx - gx, by - gy
+        d = math.hypot(dx, dy)
+        ux, uy = (dx / d, dy / d) if d > 1e-6 else (1.0, 0.0)
+        step_out = self._keeper_step_out(d)
+        tx = gx + ux * step_out
+        ty = clamp(gy + uy * step_out, -(half_goal + KEEPER_LATERAL_MARGIN_M),
+                   half_goal + KEEPER_LATERAL_MARGIN_M)
+        tx = clamp(tx, gx + 0.1, gx + KEEPER_STEP_OUT_MAX_M)
+
+        self.action = "keeper:arc"
+        self._draw_keeper(ctx, tx, ty, crossing, save=False)
+        self.walk_to((tx, ty), face=face, avoid_ball=False, avoid_robots=True)
+
+    @staticmethod
+    def _keeper_step_out(ball_goal_dist: float) -> float:
+        """Step-out distance: larger when the ball is closer to goal (closing
+        the angle), smaller when farther (hugging the line). Linear
+        interpolation + clamping."""
+        near, far = KEEPER_BALL_NEAR_M, KEEPER_BALL_FAR_M
+        lo, hi = KEEPER_STEP_OUT_MIN_M, KEEPER_STEP_OUT_MAX_M
+        if far <= near:
+            return hi
+        frac = clamp((ball_goal_dist - near) / (far - near), 0.0, 1.0)
+        return hi + (lo - hi) * frac                 # frac 0 (near) -> hi; 1 (far) -> lo
+
+    def _update_keeper_threat(
+        self,
+        crossing: tuple[float, float] | None,
+        ball_est: "BallEstimate | None",
+        half_goal: float,
+    ) -> bool:
+        """Save trigger + hysteresis. Entry is stricter than exit, to avoid
+        frame-to-frame jitter near the threshold.
+
+        Entry: ball speed >= ENTER, predicted to arrive within HORIZON, and
+        landing point within the goal mouth + MARGIN.
+        Exit: ball speed < EXIT, no longer heading toward goal, or landing
+        point clearly off target. Writes and returns ``_guard_threatened``.
+        """
+        if crossing is None or ball_est is None or not ball_est.valid:
+            self._guard_threatened = False
+            return False
+
+        y_cross, t = crossing
+        speed = ball_est.speed
+        margin = half_goal + KEEPER_SAVE_MOUTH_MARGIN_M
+
+        if self._guard_threatened:
+            self._guard_threatened = (
+                speed >= KEEPER_SAVE_EXIT_SPEED
+                and t <= KEEPER_SAVE_HORIZON_S * 1.5
+                and abs(y_cross) <= margin + 0.3
+            )
+        else:
+            self._guard_threatened = (
+                speed >= KEEPER_SAVE_BALL_SPEED
+                and t <= KEEPER_SAVE_HORIZON_S
+                and abs(y_cross) <= margin
+            )
+        return self._guard_threatened
+
+    def _draw_keeper(
+        self,
+        ctx: Context,
+        tx: float,
+        ty: float,
+        crossing: tuple[float, float] | None,
+        save: bool,
+    ) -> None:
+        """Visualization: keeper target point (magenta for save / cyan for
+        positioning) + predicted landing X + incoming-ball prediction line."""
+        from .framework import debugdraw
+
+        col = (1.0, 0.0, 1.0) if save else (0.0, 0.6, 1.0)
+        debugdraw.point(tx, ty, rgb=col, scale=0.22, ns="keeper_target")
+        if crossing is not None and ctx.ball is not None:
+            gx, _gy = own_goal(ctx)
+            cx, cy = gx + KEEPER_SAVE_LINE_M, crossing[0]
+            s = 0.18
+            debugdraw.line([(cx - s, cy - s), (cx + s, cy + s)],
+                           rgb=(1.0, 0.0, 1.0), ns="keeper_cross")
+            debugdraw.line([(cx - s, cy + s), (cx + s, cy - s)],
+                           rgb=(1.0, 0.0, 1.0), ns="keeper_cross")
+            debugdraw.line([(ctx.ball.x, ctx.ball.y), (cx, cy)],
+                           rgb=(1.0, 0.4, 0.7), ns="keeper_predict")
 
     def support(self) -> None:
-        """支援:站在 球→己方门中心 连线上距球 ``SUPPORT_DIST_M`` 处补防。
+        """Support: stand on the [ball -> own-goal-center] line at
+        ``SUPPORT_DIST_M`` from the ball, covering defensively.
 
-        站位点在球与己方门之间的封堵线上。
+        The stance point sits on the blocking line between the ball and our own goal.
         """
         ctx = self.context
         if ctx is None:
@@ -641,15 +792,36 @@ class Player:
         tx = bx + ux * along
         ty = by + uy * along
 
-        # 不越过己方底线(x >= 门线 + 0.3),横向夹进场内
+        # Don't cross our own end line (x >= goal line + 0.3), clamp laterally within the field
         half_l = ctx.field.length / 2.0
         half_w = ctx.field.width / 2.0 - 0.3
         tx = clamp(tx, -half_l + 0.3, half_l)
         ty = clamp(ty, -half_w, half_w)
         self.move_to_position((tx, ty))
 
+    def support_attack(self) -> None:
+        """Advanced attacking support: push up ahead of the ball toward the
+        opponent goal and to the open side, as a passing outlet / shooting
+        threat. Faces the ball (ready to receive), avoids the ball and robots.
+
+        Used when we're in ATTACK mode; the defensive counterpart is
+        :meth:`support` (second-line cover). See the role dispatch in main.py.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None or self.pose is None:
+            self.stop()
+            return
+        opp_ys = [r.pose.y for r in ctx.opponents.values() if r.pose is not None]
+        target = attacking_outlet_spot(
+            ctx, ball.x, ball.y, opp_ys,
+            SUPPORT_ATTACK_AHEAD_M, SUPPORT_ATTACK_WIDE_M,
+        )
+        self.move_to_position(target)
+
     def take_kickoff(self, kick_target: tuple[float, float] | None = None) -> None:
-        """我方开球/重开:未就位则绕到球后待命(避球不碰),就位后接近并踢。"""
+        """Our kickoff/restart: if not yet in position, circle around behind
+        the ball and wait (avoiding but not touching it); once in position, approach and kick."""
         ball = self.context.ball if self.context is not None else None
         if ball is None or self.pose is None:
             self.stop()
@@ -659,7 +831,7 @@ class Player:
         kick_dir = angle_to(ball.x, ball.y, *kick_target)
         cos_k, sin_k = math.cos(kick_dir), math.sin(kick_dir)
         rel_x, rel_y = self.pose.x - ball.x, self.pose.y - ball.y
-        behind = rel_x * cos_k + rel_y * sin_k          # <0 在球后方(己方侧)
+        behind = rel_x * cos_k + rel_y * sin_k          # <0 means behind the ball (our side)
         lateral = abs(-rel_x * sin_k + rel_y * cos_k)
         if behind > KICKOFF_FRONT_MARGIN or lateral > KICKOFF_LATERAL_TOL:
             stage = (
@@ -672,7 +844,8 @@ class Player:
             self.attack(kick_target)
 
     def move_to_position(self, target: tuple[float, float] | None) -> None:
-        """走到站位点(支援/防守/避让),面向球,避球+避机器人。"""
+        """Walk to a stance point (support/defense/avoidance), facing the
+        ball, avoiding both the ball and robots."""
         if target is None:
             self.stop()
             return
