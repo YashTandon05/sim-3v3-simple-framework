@@ -19,6 +19,7 @@ from ..param import (
     CORNER_DELIVERY_DEPTH_M,
     CORNER_DELIVERY_WIDE_M,
     POSSESSION_MARGIN_M,
+    SHOT_AIM_EDGE_M,
 )
 from .geom import clamp, normalize_angle, opponent_goal, push_clear_of_ball
 
@@ -198,22 +199,24 @@ def best_shot(
     ball_y: float,
     shot_range_m: float,
     lane_radius: float,
+    self_id: int | None = None,
 ) -> float | None:
-    """Pick a shooting direction (aim at the open corner away from their keeper)
-    if a scoring shot is available and the lane is clear; else None.
+    """Pick a shooting direction if a scoring shot is available and the lane is
+    clear; else None.
 
-    Only considers shots within ``shot_range_m`` of the opponent goal. Tries the
-    corner farthest from their keeper first, then the other corner, then dead
-    center; returns the first whose straight trajectory scores and whose lane is
-    clear of opponents.
+    Only considers shots within ``shot_range_m`` of the opponent goal. Aim
+    points are CENTRAL (span +/- ``SHOT_AIM_EDGE_M`` from goal center — kick
+    noise makes corner aims miss wide; on target beats top bins), tried
+    farthest-from-their-keeper first. The lane must be clear of opponents AND
+    of our own teammates (never smash the ball into our own robot — pass
+    ``self_id`` to exclude the shooter itself).
     """
     goal_x = context.field.length / 2.0
     half_goal = context.field.goal_width / 2.0
     if math.hypot(goal_x - ball_x, 0.0 - ball_y) > shot_range_m:
         return None
 
-    inset = 0.3
-    edge = half_goal - inset
+    edge = min(SHOT_AIM_EDGE_M, half_goal - 0.3)
     corners = [
         (goal_x, edge),
         (goal_x, -edge),
@@ -225,16 +228,17 @@ def best_shot(
     if keeper is not None:
         corners.sort(key=lambda c: -abs(c[1] - keeper[1]))  # farthest from keeper first
 
-    opp_positions = [
+    blockers = _opp_positions(context)
+    blockers += [
         (r.pose.x, r.pose.y)
-        for r in context.opponents.values()
-        if r.pose is not None
+        for tid, r in context.teammates.items()
+        if tid != self_id and r.pose is not None
     ]
     for ax, ay in corners:
         direction = math.atan2(ay - ball_y, ax - ball_x)
         if not _shot_on_target(ball_x, ball_y, direction, goal_x, half_goal):
             continue
-        if not _segment_clear(ball_x, ball_y, ax, ay, opp_positions, lane_radius):
+        if not _segment_clear(ball_x, ball_y, ax, ay, blockers, lane_radius):
             continue
         return direction
     return None
@@ -248,9 +252,10 @@ def forced_shot_direction(
 
     Used close to their goal when no clean lane exists — a blocked shot still
     produces deflections and rebounds in the box (where our crasher waits),
-    which beats turning away from goal. Volume of shots > purity of shots."""
+    which beats turning away from goal. Volume of shots > purity of shots.
+    Aims centrally (``SHOT_AIM_EDGE_M``) so the strike stays on target."""
     goal_x = context.field.length / 2.0
-    edge = context.field.goal_width / 2.0 - 0.3
+    edge = min(SHOT_AIM_EDGE_M, context.field.goal_width / 2.0 - 0.3)
     corners = [(goal_x, edge), (goal_x, -edge)]
     keeper = opponent_keeper_pos(context)
     if keeper is not None:

@@ -48,7 +48,12 @@ from .utils.tactics import (
     opponents_overcommitted,
     quick_pass_target,
 )
-from .utils.worldmodel import goal_line_crossing, intercept_point, predict_position
+from .utils.worldmodel import (
+    goal_line_crossing,
+    intercept_point,
+    keeper_intercept,
+    predict_position,
+)
 
 if TYPE_CHECKING:
     from .framework.config import SoccerConfig
@@ -425,6 +430,7 @@ class Player:
         avoid_ball: bool = False,
         avoid_robots: bool = False,
         arrive_dist: float = ARRIVE_DIST,
+        omni_dist: float = OMNI_DIST,
     ) -> bool:
         """Walk toward the target point. Returns whether it has arrived.
 
@@ -517,7 +523,7 @@ class Player:
             rgb=(0.0, 0.8, 0.8), ns="lookahead",
         )
 
-        if distance <= OMNI_DIST:
+        if distance <= omni_dist:
             # Close range: omnidirectional walking, translate along heading
             # while turning toward face
             wdx, wdy = math.cos(heading) * distance, math.sin(heading) * distance
@@ -680,6 +686,44 @@ class Player:
                 debugdraw.point(bx, by, rgb=(1.0, 0.5, 0.0), scale=0.15, ns="intercept")
             self.walk_to(_behind_ball(bx, by, chase_aim, CHASE_BEHIND_M))
 
+    def challenge(self, ball_est: "BallEstimate | None" = None) -> None:
+        """Defensive press: charge the ball directly and boot it clear on arrival.
+
+        :meth:`attack`'s chase point sits BEHIND the ball toward the opponent
+        goal — against a dribbling opponent that becomes perpetual backpedaling
+        (the spot retreats as the ball advances, so the defender never engages).
+        The challenge instead closes the gap straight AT the ball (meeting its
+        predicted path when rolling) and, once in kicking range, plays the
+        normal safety-first kick decision — clearance-first in our half. Foot
+        in, ball gone.
+        """
+        ball = self.context.ball if self.context is not None else None
+        if ball is None or self.pose is None:
+            self.stop()
+            return
+
+        self._kick_intent = None
+        d = dist(self.pose.x, self.pose.y, ball.x, ball.y)
+        self._kicking = d <= (KICK_EXIT_M if self._kicking else KICK_ENTER_M)
+        if self._kicking:
+            plan = self._decide_kick(passing=True)
+            if plan is None:
+                self.stop()
+                return
+            direction, power, aim = plan
+            self._draw_kick_target(aim)
+            self.kick(direction, power)
+        else:
+            self.release_kick()
+            bx, by = ball.x, ball.y
+            if ball_est is not None and ball_est.moving:
+                ix, iy = intercept_point(
+                    ball_est, self.pose.x, self.pose.y,
+                    INTERCEPT_SPEED_MPS, INTERCEPT_HORIZON_S, INTERCEPT_STEP_S,
+                )
+                bx, by = clamp_inside_field(self.context, ix, iy, margin=0.2)
+            self.walk_to((bx, by))                 # straight at it — no lining-up detour
+
     def _decide_kick(
         self, passing: bool, clear_only: bool = False,
     ) -> tuple[float, float, tuple[float, float]] | None:
@@ -717,8 +761,9 @@ class Player:
             direction = angle_to(bx, by, *goal)
             return (direction, KICK_POWER_CLEAR, self._goal_target_for_direction(direction))
 
-        # 1. Shoot — the priority. Any clear angle to goal within range.
-        shot_dir = best_shot(ctx, bx, by, SHOT_RANGE_M, SHOT_LANE_RADIUS_M)
+        # 1. Shoot — the priority. Any clear angle to goal within range (lane
+        # clear of opponents AND our own teammates).
+        shot_dir = best_shot(ctx, bx, by, SHOT_RANGE_M, SHOT_LANE_RADIUS_M, self.id)
         if shot_dir is not None:
             self._kick_intent = "shoot"
             return (shot_dir, KICK_POWER_SHOT, self._goal_target_for_direction(shot_dir))
@@ -881,6 +926,16 @@ class Player:
             tx, ty = save_x, clamp(y_cross, -limit, limit)
             if self._maybe_dive(ctx, ty, crossing):
                 return
+            # Meet the shot on its path when the ball-vs-keeper velocity solve
+            # says we can actually get there in time (blocks it earlier and
+            # kills the "step forward, miss, scramble sideways" pattern);
+            # otherwise fall back to blocking at the goal-line crossing.
+            meet = keeper_intercept(
+                ball_est, self.pose.x, self.pose.y,
+                KEEPER_SPEED_MPS, KEEPER_SAVE_HORIZON_S, INTERCEPT_STEP_S,
+            )
+            if meet is not None and meet[0] > gx + 0.15:
+                tx, ty = meet
             self.action = "keeper:save"
             self._draw_keeper(ctx, tx, ty, crossing, save=True)
             self._keeper_move_to((tx, ty), ball, avoid_robots=False)
@@ -935,21 +990,29 @@ class Player:
     def _keeper_move_to(
         self, target: tuple[float, float], ball, avoid_robots: bool,
     ) -> None:
-        """Move to a keeper target, choosing facing for speed. For a large
-        reposition, face the travel direction (fast forward walk); once within
-        ``KEEPER_SETTLE_DIST_M`` of the spot, square up to the ball (ready to
-        react, small strafes only). Never avoids the ball."""
+        """Move to a keeper target, choosing facing AND gait for speed. For a
+        large reposition, face the travel direction and RUN (omni radius shrunk
+        to ``KEEPER_RUN_OMNI_DIST_M`` so it doesn't strafe-waddle sideways —
+        default omni range is 1.5m, which covered most keeper moves); once
+        within ``KEEPER_SETTLE_DIST_M`` of the spot, square up to the ball
+        (ready to react, small strafes only). Never avoids the ball."""
         if self.pose is None:
             self.stop()
             return
         d = dist(self.pose.x, self.pose.y, target[0], target[1])
         if d > KEEPER_SETTLE_DIST_M:
             face = angle_to(self.pose.x, self.pose.y, target[0], target[1])
+            omni = KEEPER_RUN_OMNI_DIST_M          # run at it, don't waddle
         elif ball is not None:
             face = angle_to(self.pose.x, self.pose.y, ball.x, ball.y)
+            omni = OMNI_DIST
         else:
             face = 0.0
-        self.walk_to(target, face=face, avoid_ball=False, avoid_robots=avoid_robots)
+            omni = OMNI_DIST
+        self.walk_to(
+            target, face=face, avoid_ball=False, avoid_robots=avoid_robots,
+            omni_dist=omni,
+        )
 
     def _update_keeper_claim(self, ctx: Context, ball) -> bool:
         """Whether to come out and claim the ball, with hysteresis. Enter when

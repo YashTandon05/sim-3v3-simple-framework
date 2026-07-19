@@ -33,6 +33,7 @@ __all__ = [
     "BallTracker",
     "goal_line_crossing",
     "intercept_point",
+    "keeper_intercept",
     "predict_position",
 ]
 
@@ -165,6 +166,34 @@ def intercept_point(
             return (bx, by)
         t += step
     return predict_position(est, horizon)
+
+
+def keeper_intercept(
+    est: BallEstimate,
+    px: float,
+    py: float,
+    speed: float,
+    horizon: float,
+    step: float,
+) -> tuple[float, float] | None:
+    """Earliest point on the ball's predicted path a keeper at (px, py) moving
+    at ``speed`` can ACTUALLY reach in time — the ball-velocity-vs-keeper-
+    velocity meet-point solve.
+
+    Unlike :func:`intercept_point` (which falls back to a chase target), this
+    returns None when no reachable meet exists inside the horizon, so the
+    keeper can fall back to blocking at the goal-line crossing instead of
+    running somewhere it can never arrive (the old failure: step forward,
+    miss, then scramble sideways)."""
+    if not est.moving:
+        return None
+    t = step
+    while t <= horizon:
+        bx, by = predict_position(est, t)
+        if math.hypot(bx - px, by - py) <= speed * t:
+            return (bx, by)
+        t += step
+    return None
 
 
 def goal_line_crossing(

@@ -145,6 +145,8 @@ KEEPER_PLAYER_ID = 1              # Player id permanently assigned as goalkeeper
 # forward (fast); only once within KEEPER_SETTLE_DIST_M of its spot does it
 # square up to the ball (ready to react, small strafes only).
 KEEPER_SETTLE_DIST_M = 0.5       # > this from target -> face travel (fast walk); <= this -> face ball (square)
+KEEPER_RUN_OMNI_DIST_M = 0.3     # while repositioning far (> settle), use the RUN gait down to this range — kills the sideways waddle (default omni radius is 1.5m, which strafed most keeper moves)
+KEEPER_SPEED_MPS = 0.45          # assumed keeper travel speed for the save-intercept solve (its "average velocity")
 # Sweeping/claiming: come out to grab a loose ball rather than sit on the line.
 KEEPER_CLAIM_DIST_M = 2.0        # come out to claim a loose ball within this range, IF we're the closest robot to it
 KEEPER_CLAIM_EXIT_M = 2.7        # keep claiming until the ball is beyond this (hysteresis, avoids in/out flapping)
@@ -181,8 +183,18 @@ SUPPORT_ATTACK_WIDE_M = 1.8        # ...and this far to the open (fewer-opponent
 # long range. Only pass when there's no shooting angle. Volume beats placement
 # here — their keepers are weak and our crasher feeds on rebounds.
 SHOT_RANGE_M = 9.0                 # shoot within this distance of the opponent goal (raised 8->9: covers their whole half)
-SHOT_LANE_RADIUS_M = 0.45          # shot lane counts as blocked if an opponent is within this of the line
+SHOT_LANE_RADIUS_M = 0.45          # shot lane counts as blocked if an opponent (or teammate) is within this of the line
 SHOT_FORCE_RANGE_M = 5.0           # within this of their goal (and in their half), shoot EVEN WITHOUT a clean lane — deflections + rebounds still become chances
+# Aim CENTRALLY: kick direction has noise, so corner aims miss wide. Aim points
+# span only +/- this from goal center (goal mouth is +/-1.3) — on target beats
+# top bins, and their keepers rarely punish central strikes.
+SHOT_AIM_EDGE_M = 0.6
+
+# The off-ball robot crashes the box for rebounds only when the ball is
+# genuinely close to their goal (NOT tied to SHOT_RANGE_M — when that grew to
+# 9m, "crash" fired across their whole half and pulled both robots too far
+# upfield to recover on turnovers).
+CRASH_RANGE_M = 4.5
 PASS_ADVANCE_MARGIN_M = 1.5        # pass only to a teammate at least this much closer to the opp goal
 PASS_LANE_RADIUS_M = 0.45          # pass lane blocked radius
 
@@ -268,6 +280,12 @@ KICKOFF_BACKPASS_POWER = 1.2    # barely rolls — the receiver takes it at its 
 # Fallback tap (lone taker / shot clock about to expire): nudge it ahead instead.
 KICKOFF_TAP_AHEAD_M = 1.0       # tap target this far straight ahead of the ball
 KICKOFF_TAP_POWER = 2.5         # very soft — keep the ball close, don't launch it
+# After the kick is taken the taker CLEARS OUT of the receiver's driving/shot
+# lane (it was standing at the center spot, right in the path) to the opposite
+# wing, staying out of the primary role while the receiver attacks.
+KICKOFF_CLEAROUT_X_M = 1.5      # clear-out spot: ahead on the wing (a future outlet)
+KICKOFF_CLEAROUT_Y_M = 2.0      # ...on the opposite side from the receiver's lane
+KICKOFF_CLEAR_S = 2.5           # taker stays out of the primary/attacker role this long after the kick
 
 # --- Set-play shot clock ---
 # Restarts must be taken before the game controller's secondary_time expires,

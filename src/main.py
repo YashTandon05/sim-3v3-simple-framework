@@ -150,6 +150,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.defend_mode = False           # Team mode: True = press+cover (opp has ball in our half), False = attack+outlet
         store.pass_active_until = 0.0        # Time (context.now) until which the receiver commits to a pass
         store.pass_from_id = None            # Player id that played the active pass (so it doesn't chase its own pass)
+        store.kickoff_clear_until = 0.0      # Until this time, the kickoff taker stays out of the primary role (clears the receiver's lane)
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -332,13 +333,16 @@ def _ball_near_own_goal(context: Context) -> bool:
 
 
 def _ball_in_shot_range(context: Context) -> bool:
-    """True when the ball is close enough to the opponent goal that a shot is on
-    (so the off-ball player should crash for a rebound)."""
+    """True when the ball is genuinely close to the opponent goal — the cue for
+    the off-ball player to crash the box for a rebound. Deliberately uses
+    ``CRASH_RANGE_M`` (tight), NOT ``SHOT_RANGE_M`` (which spans their whole
+    half — tying crash to it sent both robots forward constantly and left
+    nobody able to recover on a turnover)."""
     ball = context.ball
     if ball is None:
         return False
     ox, oy = opponent_goal(context)
-    return dist(ball.x, ball.y, ox, oy) < SHOT_RANGE_M
+    return dist(ball.x, ball.y, ox, oy) < CRASH_RANGE_M
 
 
 def _ball_collected(context: Context, field: list[Player], exclude_id) -> bool:
@@ -376,22 +380,36 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
 
     _update_team_mode(context, store)
     danger = _ball_near_own_goal(context)
+    poss = read_possession(context)
 
     # Debug: show team mode + possession + danger near the bottom touchline.
     from .framework import debugdraw
     debugdraw.text(
         0.0, -context.field.width / 2.0 - 0.2,
         f"mode={'DEFEND' if store.defend_mode else 'ATTACK'} "
-        f"poss={read_possession(context)}{' DANGER' if danger else ''}",
+        f"poss={poss}{' DANGER' if danger else ''}",
         rgb=(0.6, 1.0, 0.6), ns="team_mode",
     )
 
+    # Right after our kickoff the taker stays out of the primary role (it's
+    # clearing the receiver's shot lane — see _act_our_kickoff).
+    candidates = field
+    if context.now < getattr(store, "kickoff_clear_until", 0.0):
+        others = [p for p in field if p.id != getattr(store, "kickoff_taker", None)]
+        if others:
+            candidates = others
+
     primary = _select_closest_attacker(
-        context, field, getattr(store, "normal_attacker", None),
+        context, candidates, getattr(store, "normal_attacker", None),
     )
     store.normal_attacker = primary.id
-    primary.action = "press" if store.defend_mode else "attack"
-    primary.attack(ball_est=store.ball_est)
+    if store.defend_mode:
+        # Press = CHALLENGE: charge the ball and boot it clear, don't shepherd.
+        primary.action = "press"
+        primary.challenge(store.ball_est)
+    else:
+        primary.action = "attack"
+        primary.attack(ball_est=store.ball_est)
 
     # Coordinate off the primary's kick decision this frame:
     # - a pass opens a short window where the OTHER field player collects it.
@@ -443,9 +461,16 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
         elif shot_on:
             p.action = "crash"
             p.crash_net()
-        else:
+        elif poss == POSSESSION_OURS:
             p.action = "outlet"
             p.support_attack()
+        else:
+            # Rest defense: ATTACK mode but possession is contested/theirs (the
+            # ball is being fought over upfield) — hold a covering position
+            # goal-side of the ball instead of pushing high, so a turnover
+            # doesn't catch both robots unable to get back.
+            p.action = "cover_rest"
+            p.support()
 
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
@@ -478,10 +503,16 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
     receive_spot = (KICKOFF_BACKPASS_X_M, KICKOFF_BACKPASS_Y_M)
 
     # Kick already taken (ball left the center spot): the taker must not touch
-    # it again before someone else does — hold off while the supporter collects.
+    # it again before someone else does — and it's standing at the center spot,
+    # smack in the receiver's driving/shot lane. Clear out to the opposite wing
+    # (a future outlet) while the supporter collects; the clear-out window
+    # persists into NORMAL via store.kickoff_clear_until so the receiver keeps
+    # the attacker role and shoots down an empty lane.
     if ball is not None and dist(ball.x, ball.y, 0.0, 0.0) > CENTER_LEAVE_DIST_M:
-        taker.action = "kickoff:hold"
-        taker.stop()
+        store.kickoff_clear_until = context.now + KICKOFF_CLEAR_S
+        side = -1.0 if KICKOFF_BACKPASS_Y_M >= 0.0 else 1.0
+        taker.action = "kickoff:clear_out"
+        taker.move_to_position((KICKOFF_CLEAROUT_X_M, side * KICKOFF_CLEAROUT_Y_M))
         if supporter is not None:
             supporter.action = "kickoff:receive"
             supporter.attack(ball_est=store.ball_est)
